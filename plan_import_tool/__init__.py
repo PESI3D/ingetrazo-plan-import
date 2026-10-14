@@ -78,12 +78,14 @@ v0.10 — layers: each ticked sheet goes onto a layer («Layers» tab) named
 after its drawing name (no scale; «file pN» without one). Missing layers
 are created, undo removes them again — same undo step as the import.
 
+1.1 — Filter (small parts, colours, thin lines, hatches) and Clean up
+(merge duplicates and overlaps, close gaps) in cleanup.py; a toolbar of
+its own (PESI3D block).
+
 1.0 — first release (v0.12 + fix: replaced/removed table rows no longer
 leave their widgets behind as ghosts after a second file or Reset).
 
-Planned: filters (colour / line width / hatches / small parts), clean up
-(join, close gaps, merge overlaps), toolbar. DXF/DWG: IngeTrazo's own
-import.
+DXF/DWG: IngeTrazo's own import.
 
 Install: copy the whole folder ``plan_import_tool`` into the plugins folder
 (Extensions ▸ Open plugins folder; on Windows %APPDATA%\\ingetrazo\\plugins)
@@ -98,7 +100,7 @@ from pathlib import Path
 
 KEY = "plan_import_tool"
 TITLE = "Plan Import"
-VERSION = "1.0"
+VERSION = "1.1"
 SETTINGS_KEY = "plugins/plan_import_tool/params"
 WHITE = 0.97          # r, g and b all above this = white (paper masks)
 GAP = 0.1             # side by side: gap between sheets, × sheet width
@@ -108,7 +110,20 @@ def default_params() -> dict:
     return {"file": "", "scale": 100, "strokes": True, "fills": True,
             "skip_white": True, "layout": "side", "last_dir": "",
             "floor_h": 3.0, "base_z": 0.0, "view_dist": 5.0,
-            "to_levels": True, "to_layers": True}
+            "to_levels": True, "to_layers": True,
+            "min_part_mm": 0.0, "min_width_mm": 0.0, "skip_hatch": False,
+            "skip_colours": [], "dedupe": True, "gap_mm": 5.0}
+
+
+#: Options the imported linework depends on (cache keys, preview state).
+CONTENT_KEYS = ("strokes", "fills", "skip_white", "min_part_mm",
+                "min_width_mm", "skip_hatch", "skip_colours", "dedupe",
+                "gap_mm")
+
+
+def content_opts(p) -> tuple:
+    return tuple((k, tuple(sorted(p.get(k) or ())) if k == "skip_colours"
+                  else p.get(k)) for k in CONTENT_KEYS)
 
 
 def _load_params() -> dict:
@@ -145,11 +160,13 @@ def _is_white(rgb) -> bool:
 
 
 def collect_runs(vectors, p: dict):
-    """The runs to import, by the content options. Returns
+    """The runs to import, by the content and filter options. Returns
     ``(runs, stats)``; runs are ``(points_pt, curved)``."""
+    from .cleanup import filter_paths
     runs = []
-    stats = {"paths": 0, "white": 0, "fills": 0, "strokes": 0}
-    for path in vectors.paths:
+    paths, fcount = filter_paths(vectors.paths, p)
+    stats = {"paths": 0, "white": 0, "fills": 0, "strokes": 0, **fcount}
+    for path in paths:
         use = False
         if path.stroke and p["strokes"]:
             if p["skip_white"] and _is_white(path.stroke_rgb):
@@ -167,6 +184,19 @@ def collect_runs(vectors, p: dict):
             stats["paths"] += 1
             runs.extend(path.runs)
     return runs, stats
+
+
+def clean_runs(runs, p: dict, mpp: float):
+    """Clean up by the options: merge duplicates/overlaps, close gaps
+    (``gap_mm`` real millimetres). Returns ``(runs, stats)``."""
+    from .cleanup import close_gaps, dedupe_overlaps
+    st = {"merged": 0, "closed": 0}
+    if p.get("dedupe", True) and runs:
+        runs, st["merged"] = dedupe_overlaps(runs)
+    gap = float(p.get("gap_mm", 0.0) or 0.0)
+    if gap > 0 and runs and mpp > 0:
+        runs, st["closed"] = close_gaps(runs, gap / 1000.0 / mpp)
+    return runs, st
 
 
 def metres_per_point(scale_n: float) -> float:
@@ -702,6 +732,71 @@ def _make_dialog_class():
             self.cb_white = QCheckBox("Skip white", self)
             form2.addRow("Content:", row_widget(
                 self.cb_strokes, self.cb_fills, self.cb_white))
+
+            def mm_spin(val, tip, step=0.1, dec=2, top=50.0):
+                sp = QDoubleSpinBox(self)
+                sp.setRange(0.0, top)
+                sp.setDecimals(dec)
+                sp.setSingleStep(step)
+                sp.setSuffix(" mm")
+                sp.setSpecialValueText("off")
+                sp.setValue(float(val or 0.0))
+                sp.setToolTip(tip)
+                sp.valueChanged.connect(self._changed)
+                return sp
+
+            self.sp_small = mm_spin(
+                self.p.get("min_part_mm", 0.0),
+                "Leave out every drawn part smaller than this ON PAPER — "
+                "letters turned into curves, dimension ticks, dots, small "
+                "symbols. 0 = off.", 0.5, 1)
+            self.sp_thin = mm_spin(
+                self.p.get("min_width_mm", 0.0),
+                "Leave out stroked lines thinner than this line width on "
+                "paper (hairlines of dimensions, hatches, auxiliary lines). "
+                "0 = off.", 0.05, 2, 5.0)
+            self.cb_hatch = QCheckBox("Hatches", self)
+            self.cb_hatch.setChecked(bool(self.p.get("skip_hatch", False)))
+            self.cb_hatch.setToolTip(
+                "Leave out hatch lines: straight lines of one colour and "
+                "width lying in rows of five or more parallels with equal "
+                "spacing (up to 2.2 mm on paper) — the way CAD programs "
+                "print a hatch line by line. Stair treads are wider apart "
+                "and stay; check the preview.")
+            self.cb_hatch.toggled.connect(self._changed)
+            self.btn_colours = QPushButton("Colours…", self)
+            self.btn_colours.setToolTip(
+                "The colours used on the ticked sheets — untick a colour to "
+                "leave out everything drawn in it (e.g. a red layer of "
+                "dimensions or furniture).")
+            self.btn_colours.clicked.connect(self._colours_dialog)
+            form2.addRow("Filter:", row_widget(
+                QLabel("Small parts below", self), self.sp_small,
+                QLabel("   Lines thinner than", self), self.sp_thin,
+                QLabel("  ", self), self.cb_hatch, self.btn_colours))
+
+            self.cb_dedupe = QCheckBox("Merge duplicates and overlaps", self)
+            self.cb_dedupe.setChecked(bool(self.p.get("dedupe", True)))
+            self.cb_dedupe.setToolTip(
+                "Lines lying on each other become one (a wall outline drawn "
+                "as fill AND stroke, double lines, overlapping pieces). "
+                "Every end point stays, so junctions keep their vertices.")
+            self.cb_dedupe.toggled.connect(self._changed)
+            self.sp_gap = QDoubleSpinBox(self)
+            self.sp_gap.setRange(0.0, 500.0)
+            self.sp_gap.setDecimals(0)
+            self.sp_gap.setSingleStep(5.0)
+            self.sp_gap.setSuffix(" mm")
+            self.sp_gap.setSpecialValueText("off")
+            self.sp_gap.setValue(float(self.p.get("gap_mm", 5.0) or 0.0))
+            self.sp_gap.setToolTip(
+                "Loose line ends closer than this (REAL millimetres, at the "
+                "row's scale) are joined to the nearest point — or onto the "
+                "nearest line — so outlines close and walls meet. 0 = off.")
+            self.sp_gap.valueChanged.connect(self._changed)
+            form2.addRow("Clean up:", row_widget(
+                self.cb_dedupe, QLabel("   Close gaps up to", self),
+                self.sp_gap))
             self.cb_levels = QCheckBox(
                 "Write storeys to the Levels panel (Stacked)", self)
             self.cb_levels.setChecked(bool(self.p.get("to_levels", True)))
@@ -770,6 +865,13 @@ def _make_dialog_class():
             self.cb_strokes.setChecked(bool(self.p["strokes"]))
             self.cb_fills.setChecked(bool(self.p["fills"]))
             self.cb_white.setChecked(bool(self.p["skip_white"]))
+            for w, k in ((self.sp_small, "min_part_mm"),
+                         (self.sp_thin, "min_width_mm"),
+                         (self.sp_gap, "gap_mm")):
+                w.setValue(float(self.p.get(k) or 0.0))
+            self.cb_hatch.setChecked(bool(self.p.get("skip_hatch")))
+            self.cb_dedupe.setChecked(bool(self.p.get("dedupe", True)))
+            self._sync_colour_btn()
             self._busy = False
 
         def _banner(self, kind, text):
@@ -1199,6 +1301,83 @@ def _make_dialog_class():
                 f"{(rect[3] - rect[1]) * pv_mm:,.0f} mm on paper.")
             self._changed()
 
+        def _sync_colour_btn(self):
+            n = len(self.p.get("skip_colours") or ())
+            self.btn_colours.setText(
+                f"Colours… ({n} off)" if n else "Colours…")
+
+        def _colours_dialog(self):
+            """Tick the colours to import (all ticked sheets together)."""
+            if self._computing or not self._pages:
+                return
+            from PySide6.QtGui import QColor, QIcon, QPixmap
+            from PySide6.QtWidgets import (QDialogButtonBox, QListWidget,
+                                           QListWidgetItem)
+            from .cleanup import colour_table
+            self._read_ui()
+            base = {"strokes": self.p["strokes"], "fills": self.p["fills"]}
+            table = {}
+            pages = sorted({r["pg"] for r in self._rows() if r["use"]})
+            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+            try:
+                for k in pages:
+                    for c, n in colour_table(self._vectors(k).paths,
+                                             base).items():
+                        table[c] = table.get(c, 0) + n
+            finally:
+                QApplication.restoreOverrideCursor()
+            skip = set(self.p.get("skip_colours") or ())
+            for c in skip:
+                table.setdefault(c, 0)
+            if not table:
+                self._error("No colours on the ticked sheets.")
+                return
+            dlg = QDialog(self)
+            dlg.setWindowTitle(f"{TITLE} — colours")
+            lay = QVBoxLayout(dlg)
+            lay.addWidget(QLabel(
+                "Ticked colours are imported. Count = drawn parts on the "
+                "ticked sheets.", dlg))
+            lst = QListWidget(dlg)
+            for c, n in sorted(table.items(), key=lambda kv: -kv[1]):
+                pm = QPixmap(18, 18)
+                pm.fill(QColor(c))
+                it = QListWidgetItem(QIcon(pm), f"{c}   ({n:,})")
+                it.setData(Qt.ItemDataRole.UserRole, c)
+                it.setFlags(it.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+                it.setCheckState(Qt.CheckState.Unchecked if c in skip
+                                 else Qt.CheckState.Checked)
+                lst.addItem(it)
+            lay.addWidget(lst)
+            b_all = QPushButton("All", dlg)
+            b_none = QPushButton("None", dlg)
+
+            def set_all(on):
+                for i in range(lst.count()):
+                    lst.item(i).setCheckState(
+                        Qt.CheckState.Checked if on
+                        else Qt.CheckState.Unchecked)
+
+            b_all.clicked.connect(lambda: set_all(True))
+            b_none.clicked.connect(lambda: set_all(False))
+            bb = QDialogButtonBox(
+                QDialogButtonBox.StandardButton.Ok
+                | QDialogButtonBox.StandardButton.Cancel, dlg)
+            bb.accepted.connect(dlg.accept)
+            bb.rejected.connect(dlg.reject)
+            lay.addWidget(row_widget(b_all, b_none))
+            lay.addWidget(bb)
+            dlg.resize(320, 420)
+            self._colour_dlg = dlg               # for tests
+            if dlg.exec() != QDialog.DialogCode.Accepted:
+                return
+            off = [lst.item(i).data(Qt.ItemDataRole.UserRole)
+                   for i in range(lst.count())
+                   if lst.item(i).checkState() != Qt.CheckState.Checked]
+            self.p["skip_colours"] = sorted(off)
+            self._sync_colour_btn()
+            self._changed()
+
         def _auto_crop(self, all_ticked):
             """Crop frames suggested from the sheet(s) — see autocrop.py."""
             if self._computing or not self._pages:
@@ -1527,6 +1706,11 @@ def _make_dialog_class():
                 "view_dist": self.sp_dist.value(),
                 "to_levels": self.cb_levels.isChecked(),
                 "to_layers": self.cb_layers.isChecked(),
+                "min_part_mm": self.sp_small.value(),
+                "min_width_mm": self.sp_thin.value(),
+                "skip_hatch": self.cb_hatch.isChecked(),
+                "dedupe": self.cb_dedupe.isChecked(),
+                "gap_mm": self.sp_gap.value(),
             })
 
         def _rows(self):
@@ -1551,9 +1735,9 @@ def _make_dialog_class():
         def _state_key(self):
             """What the result depends on — file, pages and options."""
             self._read_ui()
-            p = {k: self.p[k] for k in ("strokes", "fills", "skip_white",
-                                        "layout", "view_dist", "to_levels",
+            p = {k: self.p[k] for k in ("layout", "view_dist", "to_levels",
                                         "to_layers")}
+            p["content"] = content_opts(self.p)
             return json.dumps([self.p["file"], self._rows(), p],
                               sort_keys=True)
 
@@ -1884,7 +2068,7 @@ def _make_dialog_class():
 
         def _reset(self):
             p = default_params()
-            for k in ("strokes", "fills", "skip_white", "layout"):
+            for k in ("layout",) + CONTENT_KEYS:
                 self.p[k] = p[k]
             self._options_into_ui()
             self._busy = True
@@ -1928,10 +2112,14 @@ def _make_dialog_class():
             to its crop frame — kept per options."""
             cache = self.__dict__.setdefault("_runs_cache", {})
             k, crop = row["pg"], row["crop"]
-            key = (self.ed_file.text(), k, crop, opts)
+            key = (self.ed_file.text(), k, crop, opts, row["scale"])
             if key not in cache:
-                runs, _st = collect_runs(self._vectors(k), self.p)
+                runs, st = collect_runs(self._vectors(k), self.p)
                 runs = clip_runs(runs, crop)
+                runs, st2 = clean_runs(runs, self.p,
+                                       metres_per_point(row["scale"]))
+                st.update(st2)
+                self.__dict__.setdefault("_run_stats", {})[key] = st
                 cache[key] = (runs, runs_bbox(runs))
             return cache[key]
 
@@ -2015,7 +2203,7 @@ def _make_dialog_class():
             self._read_ui()
             path = self.p["file"]
             rows = self._rows()
-            opts = (self.p["strokes"], self.p["fills"], self.p["skip_white"])
+            opts = content_opts(self.p)
             place = self._placements(rows, opts)
             ticked = [(k, r) for k, r in enumerate(rows) if r["use"]]
             # Inside an open group the insert re-expresses a group in the
@@ -2103,12 +2291,38 @@ def _make_dialog_class():
             cmd.info = {"sheets": len(groups),
                         "edges": sum(len(g.mesh.edges) for g in groups),
                         "seconds": time.perf_counter() - t0,
-                        "empty": empty}
+                        "empty": empty,
+                        "filtered": self._filter_totals()}
             return cmd
+
+        def _filter_totals(self):
+            """Sum of what the filters and the clean up did on the ticked
+            rows (from the run cache)."""
+            stats = self.__dict__.get("_run_stats", {})
+            opts = content_opts(self.p)
+            tot = {}
+            for r in self._rows():
+                if not r["use"]:
+                    continue
+                key = (self.ed_file.text(), r["pg"], r["crop"], opts,
+                       r["scale"])
+                for k, v in (stats.get(key) or {}).items():
+                    if k in ("hatch", "small", "thin", "colour", "merged",
+                             "closed"):
+                        tot[k] = tot.get(k, 0) + v
+            return tot
 
         def _result_text(self, info):
             t = (f"{info['sheets']} sheet(s), {info['edges']:,} edges "
                  f"({info['seconds']:.1f} s)")
+            f = info.get("filtered") or {}
+            parts = [f"{f[k]:,} {lb}" for k, lb in (
+                ("hatch", "hatch lines"), ("small", "small parts"),
+                ("thin", "thin lines"), ("colour", "by colour"),
+                ("merged", "overlaps merged"), ("closed", "gaps closed"))
+                if f.get(k)]
+            if parts:
+                t += " · " + ", ".join(parts)
             if info["empty"]:
                 t += (" · nothing on page(s) "
                       + ", ".join(str(p) for p in info["empty"]))
@@ -2276,8 +2490,212 @@ def show_dialog(viewport, parent=None):
     return _OPEN
 
 
+# ---------------------------------------------------------------------------
+# Toolbar (PESI3D): icons drawn in IngeTrazo's own icon style
+# ---------------------------------------------------------------------------
+
+def _pesi3d_icons():
+    """Icon key → draw(painter, ink, accent) on a 48 px canvas."""
+    import math  # noqa: F401
+    from PySide6.QtCore import QPointF, QRectF, Qt  # noqa: F401
+    from PySide6.QtGui import (QBrush, QColor, QPainterPath, QPen,  # noqa: F401
+                               QPolygonF)
+
+    def _a(c, alpha):
+        return QColor(c.red(), c.green(), c.blue(), alpha)
+
+    def _dot(p, acc, x, y, r=3.2, color=None):
+        p.save()
+        p.setPen(Qt.NoPen)
+        p.setBrush(color or acc)
+        p.drawEllipse(QPointF(x, y), r, r)
+        p.restore()
+
+    def _poly(pts):
+        return QPolygonF([QPointF(x, y) for x, y in pts])
+
+    def _pencil(p, ink, acc):
+        """Small pencil in the lower right corner = «Edit …»."""
+        p.save()
+        p.translate(35.5, 34.5)
+        p.rotate(45)
+        pen = QPen(ink, 2.2)
+        pen.setJoinStyle(Qt.RoundJoin)
+        p.setPen(pen)
+        p.setBrush(acc)
+        p.drawRect(QRectF(-3.6, -11.0, 7.2, 13.0))
+        p.setBrush(QBrush(ink))
+        p.drawPolygon(_poly([(-3.6, 2.0), (3.6, 2.0), (0.0, 8.0)]))
+        p.restore()
+
+    def plan_import(p, ink, acc):
+        # a plan sheet (folded corner) with a floor plan on it, and an
+        # arrow taking it into the model
+        p.save()
+        p.setBrush(Qt.NoBrush)
+        p.drawPolygon(_poly([(5, 4), (25, 4), (33, 12), (33, 44), (5, 44)]))
+        p.drawPolyline(_poly([(25, 4), (25, 12), (33, 12)]))
+        p.restore()
+        p.save()                                   # walls of a plan
+        p.setPen(Qt.NoPen)
+        p.setBrush(_a(acc, 210))
+        ring = QPainterPath()
+        ring.setFillRule(Qt.OddEvenFill)
+        ring.addRect(QRectF(10.0, 17.0, 18.0, 21.0))
+        ring.addRect(QRectF(13.0, 20.0, 12.0, 15.0))
+        p.drawPath(ring)
+        p.drawRect(QRectF(18.0, 20.0, 2.5, 9.0))
+        p.restore()
+        p.save()                                   # arrow into the model
+        pen = QPen(acc, 3.4)
+        pen.setCapStyle(Qt.RoundCap)
+        pen.setJoinStyle(Qt.RoundJoin)
+        p.setPen(pen)
+        p.drawLine(QPointF(30, 30), QPointF(43, 43))
+        p.drawPolyline(_poly([(43, 34), (43, 43), (34, 43)]))
+        p.restore()
+
+    return {"import": plan_import}
+
+
+def _pesi3d_toolbar(app, title, entries):
+    """A toolbar of this plugin's own — one icon per command (PESI3D).
+
+    ``entries`` = (icon key, text, tip, callable). The icons are drawn
+    like IngeTrazo's own (views/icons.py: 48 px, ink = the palette's text
+    colour, 3 px pen, the orange accent) and redrawn when the theme flips.
+    The toolbar moves, floats and hides like the built-in ones (right-click
+    on any toolbar); its place is kept by its objectName."""
+    try:
+        from PySide6.QtCore import QEvent, QObject, QSize, Qt
+        from PySide6.QtGui import QAction, QColor, QIcon, QPainter, QPen, QPixmap
+        from PySide6.QtWidgets import QApplication, QToolBar
+    except Exception:  # noqa: BLE001 — no Qt, no toolbar
+        return None
+    win = getattr(app, "window", None)
+    if win is None:
+        return None
+    draws = _pesi3d_icons()
+
+    def make_icon(key):
+        draw = draws.get(key)
+        if draw is None:
+            return QIcon()
+        qa = QApplication.instance()
+        ink = (QColor(qa.palette().windowText().color()) if qa is not None
+               else QColor(40, 44, 52))
+        pm = QPixmap(48, 48)
+        pm.fill(Qt.transparent)
+        p = QPainter(pm)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        pen = QPen(ink, 3.0)
+        pen.setJoinStyle(Qt.RoundJoin)
+        pen.setCapStyle(Qt.RoundCap)
+        p.setPen(pen)
+        try:
+            draw(p, ink, QColor(243, 115, 41))
+        finally:
+            p.end()
+        return QIcon(pm)
+
+    name = f"pesi3d_{getattr(app, 'key', title)}"
+    tb = None
+    make = getattr(win, "_new_toolbar", None)     # the host's own builder
+    if callable(make):
+        try:
+            tb = make(title, name)
+        except Exception:  # noqa: BLE001
+            tb = None
+    if tb is None:
+        tb = QToolBar(title, win)
+        tb.setObjectName(name)
+        tb.setMovable(True)
+        tb.setFloatable(True)
+        try:
+            from views.icons import toolbar_icon_px
+            px = int(toolbar_icon_px())
+        except Exception:  # noqa: BLE001
+            px = 24
+        tb.setIconSize(QSize(px, px))
+        tb.setToolButtonStyle(Qt.ToolButtonIconOnly)
+        win.addToolBar(Qt.TopToolBarArea, tb)
+
+    actions = []
+    for key, text, tip, fn in entries:
+        act = QAction(make_icon(key), text, tb)
+        act.setToolTip(f"{text}\n{tip}" if tip else text)
+        if tip:
+            act.setStatusTip(tip)
+        act.triggered.connect(lambda _c=False, f=fn: f())
+        tb.addAction(act)
+        actions.append((act, key))
+
+    class _ThemeWatch(QObject):
+        def eventFilter(self, obj, event):  # noqa: N802 — Qt override
+            if event.type() in (QEvent.PaletteChange,
+                                QEvent.ApplicationPaletteChange,
+                                QEvent.StyleChange):
+                for a, k in actions:
+                    a.setIcon(make_icon(k))
+            return False
+
+    watch = _ThemeWatch(tb)
+    tb.installEventFilter(watch)
+    tb._pesi3d_watch = watch
+    _pesi3d_place_later(win)
+    return tb
+
+
+def _pesi3d_place_later(win):
+    """A toolbar the saved window layout does not know yet lands at the end
+    of the top row, squeezed behind the built-in ones. Once the window is
+    laid out, put new PESI3D toolbars on a row of their own under the
+    built-in ones — only the first time each one appears; after that the
+    user's own arrangement (saved with the window) wins. Every PESI3D
+    plugin carries this code; the first one to get here does it for all."""
+    if getattr(win, "_pesi3d_place_pending", False):
+        return
+    win._pesi3d_place_pending = True
+    from PySide6.QtCore import QSettings, Qt, QTimer
+    from PySide6.QtWidgets import QToolBar
+
+    def place():
+        win._pesi3d_place_pending = False
+        try:
+            st = QSettings()
+            key = "plugins/pesi3d/placed_toolbars"
+            placed = st.value(key) or []
+            if isinstance(placed, str):
+                placed = [placed]
+            placed = list(placed)
+            bars = [t for t in win.findChildren(QToolBar)
+                    if t.objectName().startswith("pesi3d_")]
+            new = [t for t in bars if t.objectName() not in placed]
+            if not new:
+                return
+            fresh = not placed            # no PESI3D row yet → open one
+            for i, t in enumerate(sorted(new, key=lambda t: t.objectName())):
+                shown = not t.isHidden()
+                win.removeToolBar(t)
+                if fresh and i == 0:
+                    win.addToolBarBreak(Qt.TopToolBarArea)
+                win.addToolBar(Qt.TopToolBarArea, t)
+                t.setVisible(shown)
+            st.setValue(key, placed + [t.objectName() for t in new])
+        except Exception:  # noqa: BLE001 — layout only, never break the app
+            pass
+
+    QTimer.singleShot(0, place)
+
+
 def setup(app) -> None:
     app.add_menu_action(
         f"{TITLE}…", lambda: show_dialog(app.viewport, app.window),
         tip="Import a floor plan or a whole plan set from a vector PDF as "
             "clean edges.")
+    _pesi3d_toolbar(app, TITLE, [
+        ("import", f"{TITLE}…",
+         "Import floor plans or a whole plan set from a vector PDF as "
+         "clean edges at their scale.",
+         lambda: show_dialog(app.viewport, app.window)),
+    ])
