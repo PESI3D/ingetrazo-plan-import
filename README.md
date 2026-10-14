@@ -5,7 +5,7 @@
 Imports CAD plans from a **vector PDF** (a plot from ArchiCAD, Revit, AutoCAD, Vectorworks …, not a scan) as clean edges at their real scale — one sheet or a whole plan set. Floor plans are stacked on their storey heights, elevations and sections stand upright around them, the storeys go into the Levels panel and every sheet onto a layer of its own.
 
 ## Install
-Download `plan_import_tool_1.0.zip` from the [latest release](../../releases/latest) and unpack it into the plugins folder (Extensions ▸ Open plugins folder; on Windows `%APPDATA%\ingetrazo\plugins`). The folder **`plan_import_tool`** must sit there as a sub-folder: `plugins\plan_import_tool\__init__.py`. Restart IngeTrazo → **Extensions ▸ Plan Import…**. Needs IngeTrazo ≥ 0.5.7.
+Download `plan_import_tool_1.1.zip` from the [latest release](../../releases/latest) and unpack it into the plugins folder (Extensions ▸ Open plugins folder; on Windows `%APPDATA%\ingetrazo\plugins`). The folder **`plan_import_tool`** must sit there as a sub-folder: `plugins\plan_import_tool\__init__.py`. Restart IngeTrazo → **Extensions ▸ Plan Import…** or the **Plan Import** toolbar. Needs IngeTrazo ≥ 0.5.7.
 
 ## The dialog
 **Browse…** a PDF. Every page gets a row; what can be read from the sheet is filled in by itself — **green** = read from the sheet, **orange** = suggested (please check), **blue** = measured/set by you. Typing a value clears the mark.
@@ -24,6 +24,8 @@ Beside the list: the selected sheet as a picture (wheel: zoom · drag: pan · do
 
 ## Features
 - **Content**: **Lines (strokes)**, **Filled shapes (outlines)** (walls drawn as grey fills), **Skip white** (paper masks). Arcs and circles come in as curves; texts, images and shadings are skipped.
+- **Filter**: **Small parts below** N mm on paper (letters turned into curves, ticks, dots), **Lines thinner than** N mm (hairlines), **Hatches** (straight lines in regular parallel rows, as CAD programs print a hatch; stair treads are wider apart and stay), **Colours…** (untick a colour to leave out everything drawn in it).
+- **Clean up**: **Merge duplicates and overlaps** (lines lying on each other become one, every end point stays a vertex), **Close gaps up to** N mm real (loose line ends join the nearest point or line).
 - **Layout**: **Side by side** (all sheets flat in a row) or **Stacked (on Elevation)**: floor plans one above the other on their **Elevation**, the site plan flat, elevations and sections **upright** around the building at **View distance**, facing outwards, their ±0,00 line at z = 0.
 - **Floor height** / **Base** / **Fill elevations**: storey heights from the levels read on the sheets, else Base + n × Floor height.
 - **Measure scale…**: click both ends of a known distance on the sheet (snaps to line ends), type its real length — the scale is computed and rounded to a usual one.

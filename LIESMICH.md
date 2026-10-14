@@ -5,7 +5,7 @@
 Importiert CAD-Pläne aus einem **Vektor-PDF** (Plot aus ArchiCAD, Revit, AutoCAD, Vectorworks …, kein Scan) als saubere Kanten im richtigen Maßstab — ein Blatt oder einen ganzen Plansatz. Grundrisse werden auf ihre Geschosshöhen gestapelt, Ansichten und Schnitte stehen hochkant drumherum, die Geschosse landen im Levels-Reiter und jedes Blatt auf einer eigenen Ebene.
 
 ## Installation
-`plan_import_tool_1.0.zip` aus dem [neuesten Release](../../releases/latest) laden und in den Plugin-Ordner entpacken (Extensions ▸ Open plugins folder; unter Windows `%APPDATA%\ingetrazo\plugins`). Der Ordner **`plan_import_tool`** muss dort als Unterordner liegen: `plugins\plan_import_tool\__init__.py`. IngeTrazo neu starten → **Extensions ▸ Plan Import…**. Ab IngeTrazo 0.5.7.
+`plan_import_tool_1.1.zip` aus dem [neuesten Release](../../releases/latest) laden und in den Plugin-Ordner entpacken (Extensions ▸ Open plugins folder; unter Windows `%APPDATA%\ingetrazo\plugins`). Der Ordner **`plan_import_tool`** muss dort als Unterordner liegen: `plugins\plan_import_tool\__init__.py`. IngeTrazo neu starten → **Extensions ▸ Plan Import…** oder die Werkzeugleiste **Plan Import**. Ab IngeTrazo 0.5.7.
 
 ## Der Dialog
 Mit **Browse…** ein PDF wählen. Jede Seite bekommt eine Zeile; was sich vom Blatt lesen lässt, wird selbst ausgefüllt — **grün** = vom Blatt gelesen, **orange** = Vorschlag (bitte prüfen), **blau** = von dir gemessen/gesetzt. Eintippen löscht die Markierung.
@@ -24,6 +24,8 @@ Daneben das gewählte Blatt als Bild (Mausrad: Zoom · Ziehen: verschieben · Do
 
 ## Funktionen
 - **Content**: **Lines (strokes)**, **Filled shapes (outlines)** (als graue Fläche gezeichnete Wände), **Skip white** (Papiermasken). Bögen und Kreise kommen als Kurven; Texte, Bilder und Verläufe werden übersprungen.
+- **Filter**: **Small parts below** N mm auf dem Papier (in Kurven gewandelte Schrift, Maßstriche, Punkte), **Lines thinner than** N mm (Haarlinien), **Hatches** (Schraffuren: gerade Linien in regelmäßigen parallelen Reihen, wie CAD-Programme sie drucken; Treppenstufen liegen weiter auseinander und bleiben), **Colours…** (eine Farbe abhaken = alles in dieser Farbe weglassen).
+- **Clean up**: **Merge duplicates and overlaps** (übereinanderliegende Linien werden eine, jeder Endpunkt bleibt ein Punkt), **Close gaps up to** N mm real (lose Linienenden werden an den nächsten Punkt oder die nächste Linie angeschlossen).
 - **Layout**: **Side by side** (alle Blätter flach nebeneinander) oder **Stacked (on Elevation)**: Grundrisse übereinander auf ihrer **Elevation**, Lageplan flach, Ansichten und Schnitte **hochkant** um das Gebäude im Abstand **View distance**, nach außen gerichtet, ±0,00 auf z = 0.
 - **Floor height** / **Base** / **Fill elevations**: Geschosshöhen aus den gelesenen Höhen, sonst Base + n × Floor height.
 - **Measure scale…**: beide Enden einer bekannten Strecke anklicken (fängt an Linienenden), echte Länge eintippen — der Maßstab wird berechnet und auf einen üblichen gerundet.
