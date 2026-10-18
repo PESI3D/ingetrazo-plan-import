@@ -5,7 +5,7 @@
 Imports CAD plans from a **vector PDF** (a plot from ArchiCAD, Revit, AutoCAD, Vectorworks …, not a scan) as clean edges at their real scale — one sheet or a whole plan set. Floor plans are stacked on their storey heights, elevations and sections stand upright around them, the storeys go into the Levels panel and every sheet onto a layer of its own.
 
 ## Install
-Download `plan_import_tool_1.1.zip` from the [latest release](../../releases/latest) and unpack it into the plugins folder (Extensions ▸ Open plugins folder; on Windows `%APPDATA%\ingetrazo\plugins`). The folder **`plan_import_tool`** must sit there as a sub-folder: `plugins\plan_import_tool\__init__.py`. Restart IngeTrazo → **Extensions ▸ Plan Import…** or the **Plan Import** toolbar. Needs IngeTrazo ≥ 0.5.7.
+Download `plan_import_tool_1.2.zip` from the [latest release](../../releases/latest) and unpack it into the plugins folder (Extensions ▸ Open plugins folder; on Windows `%APPDATA%\ingetrazo\plugins`). The folder **`plan_import_tool`** must sit there as a sub-folder: `plugins\plan_import_tool\__init__.py`. Restart IngeTrazo → **Extensions ▸ Plan Import…** or the **Plan Import** toolbar. Needs IngeTrazo ≥ 0.5.7.
 
 ## The dialog
 **Browse…** a PDF. Every page gets a row; what can be read from the sheet is filled in by itself — **green** = read from the sheet, **orange** = suggested (please check), **blue** = measured/set by you. Typing a value clears the mark.

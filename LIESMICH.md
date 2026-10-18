@@ -5,7 +5,7 @@
 Importiert CAD-Pläne aus einem **Vektor-PDF** (Plot aus ArchiCAD, Revit, AutoCAD, Vectorworks …, kein Scan) als saubere Kanten im richtigen Maßstab — ein Blatt oder einen ganzen Plansatz. Grundrisse werden auf ihre Geschosshöhen gestapelt, Ansichten und Schnitte stehen hochkant drumherum, die Geschosse landen im Levels-Reiter und jedes Blatt auf einer eigenen Ebene.
 
 ## Installation
-`plan_import_tool_1.1.zip` aus dem [neuesten Release](../../releases/latest) laden und in den Plugin-Ordner entpacken (Extensions ▸ Open plugins folder; unter Windows `%APPDATA%\ingetrazo\plugins`). Der Ordner **`plan_import_tool`** muss dort als Unterordner liegen: `plugins\plan_import_tool\__init__.py`. IngeTrazo neu starten → **Extensions ▸ Plan Import…** oder die Werkzeugleiste **Plan Import**. Ab IngeTrazo 0.5.7.
+`plan_import_tool_1.2.zip` aus dem [neuesten Release](../../releases/latest) laden und in den Plugin-Ordner entpacken (Extensions ▸ Open plugins folder; unter Windows `%APPDATA%\ingetrazo\plugins`). Der Ordner **`plan_import_tool`** muss dort als Unterordner liegen: `plugins\plan_import_tool\__init__.py`. IngeTrazo neu starten → **Extensions ▸ Plan Import…** oder die Werkzeugleiste **Plan Import**. Ab IngeTrazo 0.5.7.
 
 ## Der Dialog
 Mit **Browse…** ein PDF wählen. Jede Seite bekommt eine Zeile; was sich vom Blatt lesen lässt, wird selbst ausgefüllt — **grün** = vom Blatt gelesen, **orange** = Vorschlag (bitte prüfen), **blau** = von dir gemessen/gesetzt. Eintippen löscht die Markierung.
