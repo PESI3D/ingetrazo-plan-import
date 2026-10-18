@@ -35,6 +35,7 @@ Beside the list: the selected sheet as a picture (wheel: zoom · drag: pan · do
 - **Levels**: with Stacked the storeys go into the **Levels** tab (Niveles extension) — dashed level guides in elevations and sections.
 - **Layers**: every sheet goes onto a layer named after the plan («Erdgeschoss», «Ansicht Nord» …).
 - **Live Preview**: the import shows in the model and follows every change; **OK** keeps it, **Cancel** takes it back. The whole import is one undo step.
+- **Line styles** (1.2+): every sheet remembers how each line was drawn — stroke width, colour, fill (packed, about 100–300 kB per floor plan). The **Walls** plugin uses it to pick the walls by line style (the wall fill, say) instead of by geometry.
 
 ## Examples
 `examples/musterhaus_plansatz_1-100_A3.pdf` — a fictional plan set (2 floor plans, 4 elevations on 2 sheets, a section, title blocks): open it, choose **Stacked**, **Auto crop ▸ All ticked sheets**, switch on the **Preview**. The other files are small test sheets; the `make_*.py` scripts (reportlab) generate them.

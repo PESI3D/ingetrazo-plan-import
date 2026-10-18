@@ -35,6 +35,7 @@ Daneben das gewählte Blatt als Bild (Mausrad: Zoom · Ziehen: verschieben · Do
 - **Levels**: bei Stacked kommen die Geschosse in den Reiter **Levels** (Niveles-Erweiterung) — gestrichelte Höhenlinien in Ansichten und Schnitten.
 - **Layers**: jedes Blatt kommt auf eine Ebene mit dem Plannamen («Erdgeschoss», «Ansicht Nord» …).
 - **Live Preview**: der Import erscheint im Modell und folgt jeder Änderung; **OK** übernimmt, **Cancel** nimmt zurück. Der ganze Import ist ein Undo-Schritt.
+- **Linienarten** (ab 1.2): jedes Blatt merkt sich, wie jede Linie gezeichnet war — Strichstärke, Farbe, Füllung (gepackt, ca. 100–300 kB je Grundriss). Das Plugin **Walls** wählt damit die Wände nach Linienart (z. B. die Wandfüllung) statt nach Geometrie.
 
 ## Beispiele
 `examples/musterhaus_plansatz_1-100_A3.pdf` — ein erfundener Plansatz (2 Grundrisse, 4 Ansichten auf 2 Blättern, ein Schnitt, Planköpfe): öffnen, **Stacked** wählen, **Auto crop ▸ All ticked sheets**, **Preview** einschalten. Die anderen Dateien sind kleine Testblätter; die `make_*.py`-Skripte (reportlab) erzeugen sie.

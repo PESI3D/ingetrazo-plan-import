@@ -96,11 +96,12 @@ PDF parsing: pypdf (BSD-3-Clause), vendored in ``_vendor/pypdf``.
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 
 KEY = "plan_import_tool"
 TITLE = "Plan Import"
-VERSION = "1.1"
+VERSION = "1.2"
 SETTINGS_KEY = "plugins/plan_import_tool/params"
 WHITE = 0.97          # r, g and b all above this = white (paper masks)
 GAP = 0.1             # side by side: gap between sheets, × sheet width
@@ -184,6 +185,95 @@ def collect_runs(vectors, p: dict):
             stats["paths"] += 1
             runs.extend(path.runs)
     return runs, stats
+
+
+#: Coordinates in the style record: integer thousandths of a sheet point.
+STYLE_GRID = 1000
+
+
+def style_key(path) -> tuple:
+    """How a path is drawn: ``(stroke width mm | 0, stroke rgb | None,
+    fill rgb | None)`` — colours to two decimals."""
+    pen = path.stroke and not _is_white(path.stroke_rgb)
+    width = round(path.width * 25.4 / 72.0, 2) if pen else 0.0
+    srgb = tuple(round(c, 2) for c in path.stroke_rgb) if pen else None
+    frgb = (tuple(round(c, 2) for c in path.fill_rgb)
+            if path.fill and not _is_white(path.fill_rgb) else None)
+    return width, srgb, frgb
+
+
+def style_record(vectors, p: dict, crop=None) -> dict:
+    """The sheet's drawing kept BY LINE STYLE, for plugins that tell
+    building parts apart by how they are drawn (Walls: the cut walls are
+    the filled shapes or the heavy pen). ``{"grid", "styles": [{"w",
+    "stroke", "fill", "len", "area"}], "runs": {sid: [[x, y, x, y, …]]},
+    "fills": [{"s": sid, "eo": evenodd, "rings": [[x, y, …]]}]}`` in sheet
+    points × ``STYLE_GRID``, cut to ``crop``. Same paths as the import
+    (filters and «Skip white» applied)."""
+    from .cleanup import filter_paths
+    paths, _counts = filter_paths(vectors.paths, p)
+    g = STYLE_GRID
+    styles, index = [], {}
+    runs_by, fills = {}, []
+
+    def sid_of(path):
+        k = style_key(path)
+        if k not in index:
+            index[k] = len(styles)
+            styles.append({"w": k[0], "stroke": list(k[1]) if k[1] else None,
+                           "fill": list(k[2]) if k[2] else None,
+                           "len": 0.0, "area": 0.0})
+        return index[k]
+
+    for path in paths:
+        k = style_key(path)
+        if k[1] is None and k[2] is None:
+            continue                         # white on white: not drawn
+        sid = sid_of(path)
+        st = styles[sid]
+        for run, _curved in clip_runs(path.runs, crop):
+            if len(run) < 2:
+                continue
+            runs_by.setdefault(sid, []).append(
+                [int(round(c * g)) for pt in run for c in pt])
+            st["len"] += sum(math.hypot(b[0] - a[0], b[1] - a[1])
+                             for a, b in zip(run, run[1:]))
+        if k[2] is not None:
+            rings = []
+            for run, _curved in path.runs:
+                if len(run) < 3:
+                    continue
+                if crop is not None:
+                    xs = [x for x, _y in run]
+                    ys = [y for _x, y in run]
+                    cx, cy = (min(xs) + max(xs)) / 2, (min(ys) + max(ys)) / 2
+                    if not (crop[0] <= cx <= crop[2] and crop[1] <= cy <= crop[3]):
+                        continue
+                rings.append([int(round(c * g)) for pt in run for c in pt])
+                a = 0.0
+                for (x0, y0), (x1, y1) in zip(run, run[1:] + run[:1]):
+                    a += x0 * y1 - x1 * y0
+                st["area"] += abs(a) / 2.0
+            if rings:
+                fills.append({"s": sid, "eo": bool(path.evenodd), "rings": rings})
+    for st in styles:
+        st["len"] = round(st["len"], 1)
+        st["area"] = round(st["area"], 1)
+    # The geometry packed (zlib + base64 JSON): a sheet holds tens of
+    # thousands of lines and travels in the document.
+    import base64
+    import zlib
+    blob = json.dumps({"runs": {str(k): v for k, v in runs_by.items()},
+                       "fills": fills}, separators=(",", ":"))
+    data = base64.b64encode(zlib.compress(blob.encode("ascii"), 6)).decode("ascii")
+    return {"grid": g, "styles": styles, "data": data}
+
+
+def unpack_style_record(rec) -> dict:
+    """``{"runs": {sid: [[x, y, …]]}, "fills": [...]}`` of a style record."""
+    import base64
+    import zlib
+    return json.loads(zlib.decompress(base64.b64decode(rec["data"])))
 
 
 def clean_runs(runs, p: dict, mpp: float):
@@ -2228,6 +2318,19 @@ def _make_dialog_class():
                         continue
                     g = build_group(runs, metres_per_point(r["scale"]),
                                     "", off, axes)
+                    # How every line was drawn, for plugins like Walls
+                    # (the edges themselves keep no style).
+                    try:
+                        rec = style_record(self._vectors(r["pg"]), self.p,
+                                           r["crop"])
+                        rec.update({"version": VERSION, "page": r["page"],
+                                    "scale": r["scale"],
+                                    "mpp": metres_per_point(r["scale"]),
+                                    "offset": list(off),
+                                    "axes": [list(a) for a in axes]})
+                        g.ext = {KEY: rec}
+                    except Exception:                      # noqa: BLE001
+                        pass                 # the import works without it
                     self._built[key] = g
                 name = r["name"]
                 same = self._rows_of_page(r["pg"])
