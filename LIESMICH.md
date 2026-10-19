@@ -5,7 +5,7 @@
 Importiert CAD-Pläne aus einem **Vektor-PDF** (Plot aus ArchiCAD, Revit, AutoCAD, Vectorworks …, kein Scan) als saubere Kanten im richtigen Maßstab — ein Blatt oder einen ganzen Plansatz. Grundrisse werden auf ihre Geschosshöhen gestapelt, Ansichten und Schnitte stehen hochkant drumherum, die Geschosse landen im Levels-Reiter und jedes Blatt auf einer eigenen Ebene.
 
 ## Installation
-`plan_import_tool_1.2.zip` aus dem [neuesten Release](../../releases/latest) laden und in den Plugin-Ordner entpacken (Extensions ▸ Open plugins folder; unter Windows `%APPDATA%\ingetrazo\plugins`). Der Ordner **`plan_import_tool`** muss dort als Unterordner liegen: `plugins\plan_import_tool\__init__.py`. IngeTrazo neu starten → **Extensions ▸ Plan Import…** oder die Werkzeugleiste **Plan Import**. Ab IngeTrazo 0.5.7.
+`plan_import_tool_1.2.1.zip` aus dem [neuesten Release](../../releases/latest) laden und in den Plugin-Ordner entpacken (Extensions ▸ Open plugins folder; unter Windows `%APPDATA%\ingetrazo\plugins`). Der Ordner **`plan_import_tool`** muss dort als Unterordner liegen: `plugins\plan_import_tool\__init__.py`. IngeTrazo neu starten → **Extensions ▸ Plan Import…** oder die Werkzeugleiste **Plan Import**. Ab IngeTrazo 0.5.7 · getestet mit IngeTrazo 0.5.8.
 
 ## Der Dialog
 Mit **Browse…** ein PDF wählen. Jede Seite bekommt eine Zeile; was sich vom Blatt lesen lässt, wird selbst ausgefüllt — **grün** = vom Blatt gelesen, **orange** = Vorschlag (bitte prüfen), **blau** = von dir gemessen/gesetzt. Eintippen löscht die Markierung.
@@ -36,6 +36,12 @@ Daneben das gewählte Blatt als Bild (Mausrad: Zoom · Ziehen: verschieben · Do
 - **Layers**: jedes Blatt kommt auf eine Ebene mit dem Plannamen («Erdgeschoss», «Ansicht Nord» …).
 - **Live Preview**: der Import erscheint im Modell und folgt jeder Änderung; **OK** übernimmt, **Cancel** nimmt zurück. Der ganze Import ist ein Undo-Schritt.
 - **Linienarten** (ab 1.2): jedes Blatt merkt sich, wie jede Linie gezeichnet war — Strichstärke, Farbe, Füllung (gepackt, ca. 100–300 kB je Grundriss). Das Plugin **Walls** wählt damit die Wände nach Linienart (z. B. die Wandfüllung) statt nach Geometrie.
+
+## Änderungen
+- **1.2.1** — der PDF-Leser füllt IngeTrazos Protokoll nicht mehr mit dem, was er in einem PDF selbst repariert («incorrect startxref pointer» …); getestet mit IngeTrazo 0.5.8.
+- **1.2** — **Linienarten**: jedes Blatt merkt sich, wie jede Linie gezeichnet war (Strichstärke, Farbe, Füllung) — für das Plugin [Walls](https://github.com/PESI3D/ingetrazo-walls).
+- **1.1** — Filter (Kleinteile, dünne Linien, Schraffuren, Farben), Aufräumen (Doppelte und Überlappungen, Lücken schließen), eigene Werkzeugleiste, Ergebniszeile.
+- **1.0** — erste Veröffentlichung: Plansätze aus Vektor-PDFs, Seitenliste, gestapelte Geschosse und aufgestellte Ansichten, Maßstab messen, Zuschneiden und Auto crop, Referenzpunkt, Levels und Ebenen, Live-Vorschau.
 
 ## Beispiele
 `examples/musterhaus_plansatz_1-100_A3.pdf` — ein erfundener Plansatz (2 Grundrisse, 4 Ansichten auf 2 Blättern, ein Schnitt, Planköpfe): öffnen, **Stacked** wählen, **Auto crop ▸ All ticked sheets**, **Preview** einschalten. Die anderen Dateien sind kleine Testblätter; die `make_*.py`-Skripte (reportlab) erzeugen sie.

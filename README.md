@@ -5,7 +5,7 @@
 Imports CAD plans from a **vector PDF** (a plot from ArchiCAD, Revit, AutoCAD, Vectorworks …, not a scan) as clean edges at their real scale — one sheet or a whole plan set. Floor plans are stacked on their storey heights, elevations and sections stand upright around them, the storeys go into the Levels panel and every sheet onto a layer of its own.
 
 ## Install
-Download `plan_import_tool_1.2.zip` from the [latest release](../../releases/latest) and unpack it into the plugins folder (Extensions ▸ Open plugins folder; on Windows `%APPDATA%\ingetrazo\plugins`). The folder **`plan_import_tool`** must sit there as a sub-folder: `plugins\plan_import_tool\__init__.py`. Restart IngeTrazo → **Extensions ▸ Plan Import…** or the **Plan Import** toolbar. Needs IngeTrazo ≥ 0.5.7.
+Download `plan_import_tool_1.2.1.zip` from the [latest release](../../releases/latest) and unpack it into the plugins folder (Extensions ▸ Open plugins folder; on Windows `%APPDATA%\ingetrazo\plugins`). The folder **`plan_import_tool`** must sit there as a sub-folder: `plugins\plan_import_tool\__init__.py`. Restart IngeTrazo → **Extensions ▸ Plan Import…** or the **Plan Import** toolbar. Needs IngeTrazo ≥ 0.5.7 · tested with IngeTrazo 0.5.8.
 
 ## The dialog
 **Browse…** a PDF. Every page gets a row; what can be read from the sheet is filled in by itself — **green** = read from the sheet, **orange** = suggested (please check), **blue** = measured/set by you. Typing a value clears the mark.
@@ -36,6 +36,12 @@ Beside the list: the selected sheet as a picture (wheel: zoom · drag: pan · do
 - **Layers**: every sheet goes onto a layer named after the plan («Erdgeschoss», «Ansicht Nord» …).
 - **Live Preview**: the import shows in the model and follows every change; **OK** keeps it, **Cancel** takes it back. The whole import is one undo step.
 - **Line styles** (1.2+): every sheet remembers how each line was drawn — stroke width, colour, fill (packed, about 100–300 kB per floor plan). The **Walls** plugin uses it to pick the walls by line style (the wall fill, say) instead of by geometry.
+
+## Changelog
+- **1.2.1** — the PDF reader no longer fills IngeTrazo's log with what it repairs by itself in a PDF («incorrect startxref pointer» …); tested with IngeTrazo 0.5.8.
+- **1.2** — **line styles**: every sheet remembers how each line was drawn (stroke width, colour, fill) — for the [Walls](https://github.com/PESI3D/ingetrazo-walls) plugin.
+- **1.1** — filters (small parts, thin lines, hatches, colours), clean up (duplicates and overlaps, close gaps), own toolbar, result line.
+- **1.0** — first release: plan sets from vector PDFs, page list, stacked storeys and upright views, measure scale, crop and auto crop, reference point, levels and layers, Live Preview.
 
 ## Examples
 `examples/musterhaus_plansatz_1-100_A3.pdf` — a fictional plan set (2 floor plans, 4 elevations on 2 sheets, a section, title blocks): open it, choose **Stacked**, **Auto crop ▸ All ticked sheets**, switch on the **Preview**. The other files are small test sheets; the `make_*.py` scripts (reportlab) generate them.

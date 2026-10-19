@@ -101,7 +101,7 @@ from pathlib import Path
 
 KEY = "plan_import_tool"
 TITLE = "Plan Import"
-VERSION = "1.2"
+VERSION = "1.2.1"
 SETTINGS_KEY = "plugins/plan_import_tool/params"
 WHITE = 0.97          # r, g and b all above this = white (paper masks)
 GAP = 0.1             # side by side: gap between sheets, × sheet width
