@@ -12,17 +12,44 @@ can give it one curve id (an arc selects as one contour, like a drawn one).
 Text (BT…ET), images and shadings are counted, never converted. Clipping
 paths that are not painted (``W n``) are dropped.
 
-PDF parsing itself is pypdf's (BSD-3, vendored in ``_vendor``).
+PDF parsing itself is pypdf's (BSD-3, vendored in ``_vendor``); the hot
+loops read the decoded streams faster in ``content_stream``.
 """
 from __future__ import annotations
 
+import contextlib
+import gc
 import math
 import os
 import re
 import sys
+import threading
 from dataclasses import dataclass, field
 
 _VENDOR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_vendor")
+
+_GC_LOCK = threading.Lock()
+_GC_HOLD = [0, False]        # holders, GC enabled before the first
+
+
+@contextlib.contextmanager
+def gc_paused():
+    """No cyclic GC while millions of tuples (points, runs, edges) are
+    built: every collection would walk all of them again — about half the
+    time of a big sheet. IngeTrazo's own importers do the same. Nests and
+    works across threads: GC comes back when the last holder leaves."""
+    with _GC_LOCK:
+        if _GC_HOLD[0] == 0:
+            _GC_HOLD[1] = gc.isenabled()
+            gc.disable()
+        _GC_HOLD[0] += 1
+    try:
+        yield
+    finally:
+        with _GC_LOCK:
+            _GC_HOLD[0] -= 1
+            if _GC_HOLD[0] == 0 and _GC_HOLD[1]:
+                gc.enable()
 
 
 def _pypdf():
@@ -235,11 +262,26 @@ def page_texts(path, page_index: int, reader=None) -> tuple:
                               bool(_SCALE_ANY.search(t))))
 
     try:
-        text = page.extract_text(visitor_text=visit) or ""
+        text = _extract_text(reader, page, visit, items) or ""
     except Exception:                                      # noqa: BLE001
         return None, None, items
     name, scale = _title_from(text)
     return name, scale, items
+
+
+def _extract_text(reader, page, visit, items):
+    """pypdf's ``page.extract_text(visitor_text=visit)`` — from the text
+    operators alone when they can be cut out (a sheet's few hundred texts
+    instead of its 30 MB of lines); else, or on any trouble there, from the
+    whole stream. (A stream pypdf cannot parse at all now still gives the
+    texts of its text objects.)"""
+    from . import content_stream
+    if content_stream.usable():
+        try:
+            return content_stream.extract_text(reader, page, visit)
+        except Exception:                                  # noqa: BLE001
+            items.clear()             # texts of the short cut, if any
+    return page.extract_text(visitor_text=visit)
 
 
 def page_title(path, page_index: int, reader=None) -> tuple:
@@ -272,166 +314,178 @@ def _page_base(page):
     return base, w, h
 
 
-def extract(path, page_index: int = 0, tol: float = 0.1) -> PageVectors:
+def extract(path, page_index: int = 0, tol: float = 0.1,
+            reader=None) -> PageVectors:
     """All painted paths of page ``page_index`` (0-based). ``tol`` is the
-    curve flattening tolerance in page points."""
-    reader = _reader(path)
-    from pypdf.generic import ContentStream
-
+    curve flattening tolerance in page points. ``reader``: an open reader
+    of ``path`` to use (the background reading keeps one)."""
+    reader = reader or _reader(path)
     if not 0 <= page_index < len(reader.pages):
         raise PdfImportError(f"The PDF has no page {page_index + 1}.")
     page = reader.pages[page_index]
     base, w, h = _page_base(page)
 
     out = PageVectors(width=w, height=h)
-    counts = out.counts
-
-    def bump(k, n=1):
-        counts[k] = counts.get(k, 0) + n
-
-    def walk(content, resources, ctm, depth):
-        if depth > 12:
-            return
-        try:
-            ops = ContentStream(content, reader).operations
-        except Exception:                                  # noqa: BLE001
-            bump("unreadable streams")
-            return
-        gs = _State(ctm)
-        stack = []
-        sub = []           # subpaths: list of [runs]; run = [pts, curved]
-        cur = None         # current point (user space)
-        start = None
-        in_text = False
-
-        def P(x, y):
-            return _apply(gs.ctm, float(x), float(y))
-
-        def new_run(curved, first):
-            sub[-1].append([[first], curved])
-
-        def seg_to(pt, curved):
-            if not sub:
-                sub.append([])
-            runs = sub[-1]
-            if not runs or runs[-1][1] != curved:
-                prev = runs[-1][0][-1] if runs else P(*cur)
-                new_run(curved, prev)
-            return sub[-1][-1][0]
-
-        def paint(stroke, fill, evenodd=False):
-            if sub:
-                runs = [(pts, c) for r in sub for pts, c in r if len(pts) > 1]
-                if runs:
-                    out.paths.append(PdfPath(
-                        runs, stroke, fill, gs.srgb, gs.frgb,
-                        gs.lw * _scale_of(gs.ctm), evenodd))
-            sub.clear()
-
-        for operands, op in ops:
-            if isinstance(op, bytes):
-                op = op.decode("latin-1")
-            if in_text:
-                if op == "ET":
-                    in_text = False
-                elif op in ("Tj", "TJ", "'", '"'):
-                    bump("text")
-                continue
-            if op == "q":
-                stack.append(gs.copy())
-            elif op == "Q":
-                if stack:
-                    gs = stack.pop()
-            elif op == "cm":
-                gs.ctm = _mul(tuple(float(v) for v in operands), gs.ctm)
-            elif op == "w":
-                gs.lw = float(operands[0])
-            elif op in ("RG", "G", "K", "SC", "SCN"):
-                c = _color(operands)
-                if c:
-                    gs.srgb = c
-            elif op in ("rg", "g", "k", "sc", "scn"):
-                c = _color(operands)
-                if c:
-                    gs.frgb = c
-            elif op == "m":
-                cur = (float(operands[0]), float(operands[1]))
-                start = cur
-                sub.append([])
-                sub[-1].append([[P(*cur)], False])
-            elif op == "l":
-                if cur is None:
-                    continue
-                nxt = (float(operands[0]), float(operands[1]))
-                seg_to(nxt, False).append(P(*nxt))
-                cur = nxt
-            elif op in ("c", "v", "y"):
-                if cur is None:
-                    continue
-                v = [float(o) for o in operands]
-                if op == "c":
-                    c1, c2, end = (v[0], v[1]), (v[2], v[3]), (v[4], v[5])
-                elif op == "v":
-                    c1, c2, end = cur, (v[0], v[1]), (v[2], v[3])
-                else:
-                    c1, c2, end = (v[0], v[1]), (v[2], v[3]), (v[2], v[3])
-                pts = seg_to(end, True)
-                pts.extend(_bezier(P(*cur), P(*c1), P(*c2), P(*end), tol))
-                cur = end
-            elif op == "h":
-                if cur is not None and start is not None and sub:
-                    if math.dist(P(*cur), P(*start)) > 1e-9:
-                        seg_to(start, False).append(P(*start))
-                    cur = start
-            elif op == "re":
-                x, y, rw, rh = (float(o) for o in operands)
-                corners = [P(x, y), P(x + rw, y), P(x + rw, y + rh),
-                           P(x, y + rh), P(x, y)]
-                sub.append([[corners, False]])
-                cur = start = (x, y)
-            elif op in ("S", "s"):
-                if op == "s" and cur is not None and start is not None \
-                        and sub:
-                    seg_to(start, False).append(P(*start))
-                paint(True, False)
-            elif op in ("f", "F", "f*"):
-                paint(False, True, op == "f*")
-            elif op in ("B", "B*", "b", "b*"):
-                if op in ("b", "b*") and cur is not None \
-                        and start is not None and sub:
-                    if math.dist(P(*cur), P(*start)) > 1e-9:
-                        seg_to(start, False).append(P(*start))
-                paint(True, True, op.endswith("*"))
-            elif op == "n":
-                sub.clear()                       # clipping path only
-            elif op == "BT":
-                in_text = True
-            elif op == "BI":
-                bump("images")
-            elif op == "sh":
-                bump("shadings")
-            elif op == "Do":
-                name = operands[0]
-                try:
-                    xo = resources["/XObject"][name].get_object()
-                except Exception:                          # noqa: BLE001
-                    continue
-                subtype = xo.get("/Subtype")
-                if subtype == "/Form":
-                    m = tuple(float(v) for v in xo.get(
-                        "/Matrix", (1, 0, 0, 1, 0, 0)))
-                    res = xo.get("/Resources")
-                    res = res.get_object() if res is not None else resources
-                    walk(xo, res, _mul(m, gs.ctm), depth + 1)
-                elif subtype == "/Image":
-                    bump("images")
-
+    from . import content_stream
+    walk = content_stream.walk if content_stream.usable() else _walk_ops
     resources = page.get("/Resources")
     resources = resources.get_object() if resources is not None else {}
     contents = page.get_contents()
     if contents is not None:
-        walk(contents, resources, base, 0)
+        with gc_paused():
+            walk((reader, out.paths, out.counts, tol, walk), contents,
+                 resources, base, 0)
     return out
+
+
+def _walk_ops(ctx, content, resources, ctm, depth):
+    """Walk one content stream (and the Form XObjects inside it) over
+    pypdf's operations: its painted paths into ``paths``, what is skipped
+    into ``counts``. ``ctx`` = ``(reader, paths, counts, tol, walk)``,
+    ``walk`` the function for the forms inside. The plain way —
+    ``content_stream.walk`` gives the same, faster, and falls back to this
+    for what it does not model."""
+    if depth > 12:
+        return
+    reader, paths, counts, tol, walk = ctx
+    from pypdf.generic import ContentStream
+
+    def bump(k, n=1):
+        counts[k] = counts.get(k, 0) + n
+
+    try:
+        ops = ContentStream(content, reader).operations
+    except Exception:                                      # noqa: BLE001
+        bump("unreadable streams")
+        return
+    gs = _State(ctm)
+    stack = []
+    sub = []           # subpaths: list of [runs]; run = [pts, curved]
+    cur = None         # current point (user space)
+    start = None
+    in_text = False
+
+    def P(x, y):
+        return _apply(gs.ctm, float(x), float(y))
+
+    def new_run(curved, first):
+        sub[-1].append([[first], curved])
+
+    def seg_to(pt, curved):
+        if not sub:
+            sub.append([])
+        runs = sub[-1]
+        if not runs or runs[-1][1] != curved:
+            prev = runs[-1][0][-1] if runs else P(*cur)
+            new_run(curved, prev)
+        return sub[-1][-1][0]
+
+    def paint(stroke, fill, evenodd=False):
+        if sub:
+            runs = [(pts, c) for r in sub for pts, c in r if len(pts) > 1]
+            if runs:
+                paths.append(PdfPath(
+                    runs, stroke, fill, gs.srgb, gs.frgb,
+                    gs.lw * _scale_of(gs.ctm), evenodd))
+        sub.clear()
+
+    for operands, op in ops:
+        if isinstance(op, bytes):
+            op = op.decode("latin-1")
+        if in_text:
+            if op == "ET":
+                in_text = False
+            elif op in ("Tj", "TJ", "'", '"'):
+                bump("text")
+            continue
+        if op == "q":
+            stack.append(gs.copy())
+        elif op == "Q":
+            if stack:
+                gs = stack.pop()
+        elif op == "cm":
+            gs.ctm = _mul(tuple(float(v) for v in operands), gs.ctm)
+        elif op == "w":
+            gs.lw = float(operands[0])
+        elif op in ("RG", "G", "K", "SC", "SCN"):
+            c = _color(operands)
+            if c:
+                gs.srgb = c
+        elif op in ("rg", "g", "k", "sc", "scn"):
+            c = _color(operands)
+            if c:
+                gs.frgb = c
+        elif op == "m":
+            cur = (float(operands[0]), float(operands[1]))
+            start = cur
+            sub.append([])
+            sub[-1].append([[P(*cur)], False])
+        elif op == "l":
+            if cur is None:
+                continue
+            nxt = (float(operands[0]), float(operands[1]))
+            seg_to(nxt, False).append(P(*nxt))
+            cur = nxt
+        elif op in ("c", "v", "y"):
+            if cur is None:
+                continue
+            v = [float(o) for o in operands]
+            if op == "c":
+                c1, c2, end = (v[0], v[1]), (v[2], v[3]), (v[4], v[5])
+            elif op == "v":
+                c1, c2, end = cur, (v[0], v[1]), (v[2], v[3])
+            else:
+                c1, c2, end = (v[0], v[1]), (v[2], v[3]), (v[2], v[3])
+            pts = seg_to(end, True)
+            pts.extend(_bezier(P(*cur), P(*c1), P(*c2), P(*end), tol))
+            cur = end
+        elif op == "h":
+            if cur is not None and start is not None and sub:
+                if math.dist(P(*cur), P(*start)) > 1e-9:
+                    seg_to(start, False).append(P(*start))
+                cur = start
+        elif op == "re":
+            x, y, rw, rh = (float(o) for o in operands)
+            corners = [P(x, y), P(x + rw, y), P(x + rw, y + rh),
+                       P(x, y + rh), P(x, y)]
+            sub.append([[corners, False]])
+            cur = start = (x, y)
+        elif op in ("S", "s"):
+            if op == "s" and cur is not None and start is not None \
+                    and sub:
+                seg_to(start, False).append(P(*start))
+            paint(True, False)
+        elif op in ("f", "F", "f*"):
+            paint(False, True, op == "f*")
+        elif op in ("B", "B*", "b", "b*"):
+            if op in ("b", "b*") and cur is not None \
+                    and start is not None and sub:
+                if math.dist(P(*cur), P(*start)) > 1e-9:
+                    seg_to(start, False).append(P(*start))
+            paint(True, True, op.endswith("*"))
+        elif op == "n":
+            sub.clear()                       # clipping path only
+        elif op == "BT":
+            in_text = True
+        elif op == "BI":
+            bump("images")
+        elif op == "sh":
+            bump("shadings")
+        elif op == "Do":
+            name = operands[0]
+            try:
+                xo = resources["/XObject"][name].get_object()
+            except Exception:                          # noqa: BLE001
+                continue
+            subtype = xo.get("/Subtype")
+            if subtype == "/Form":
+                m = tuple(float(v) for v in xo.get(
+                    "/Matrix", (1, 0, 0, 1, 0, 0)))
+                res = xo.get("/Resources")
+                res = res.get_object() if res is not None else resources
+                walk(ctx, xo, res, _mul(m, gs.ctm), depth + 1)
+            elif subtype == "/Image":
+                bump("images")
 
 
 # ---- storey levels read from the sheets ----------------------------------
