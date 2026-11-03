@@ -136,5 +136,38 @@ class CloseGapsTest(unittest.TestCase):
                     self.same(runs, gap, f"{name} p{i + 1}")
 
 
+try:
+    import numpy
+except ImportError:                    # IngeTrazo has it; a bare Python may not
+    numpy = None
+
+
+@unittest.skipIf(numpy is None, "needs numpy")
+class EdgeArraysTest(unittest.TestCase):
+    def test_like_the_loop(self):
+        """build_group's edges as 1.2.1 listed them, run by run."""
+        rng = random.Random(4)
+        for _case in range(50):
+            runs = lattice_runs(rng, rng.randrange(0, 60), 0.5, 20)
+            runs += [([(0.0, 0.0)], True), ([], False)]
+            rng.shuffle(runs)
+            xy, ia, ib, curved = pit.edge_arrays(runs)
+            want_xy, want_ia, want_ib, want_c = [], [], [], []
+            for run, c in runs:
+                if len(run) < 2:
+                    continue
+                base, e0 = len(want_xy), len(want_ia)
+                want_xy += run
+                for k in range(len(run) - 1):
+                    want_ia.append(base + k)
+                    want_ib.append(base + k + 1)
+                if c and len(run) > 2:
+                    want_c.append((e0, len(want_ia)))
+            self.assertEqual([tuple(p) for p in xy.tolist()], want_xy)
+            self.assertEqual(ia.tolist(), want_ia)
+            self.assertEqual(ib.tolist(), want_ib)
+            self.assertEqual(curved, want_c)
+
+
 if __name__ == "__main__":
     unittest.main()
