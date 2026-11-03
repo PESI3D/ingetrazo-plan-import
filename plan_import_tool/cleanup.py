@@ -22,6 +22,7 @@ Clean up (on the runs, in sheet points):
 from __future__ import annotations
 
 import math
+from collections import Counter
 
 PT_TO_MM = 25.4 / 72.0
 
@@ -244,6 +245,277 @@ def dedupe_overlaps(runs, tol=0.05):
     return out, merged
 
 
+def _ring(ix, iy, k):
+    """The grid cells at Chebyshev distance ``k`` from cell (ix, iy)."""
+    xs = range(ix - k, ix + k + 1)
+    ys = range(iy - k + 1, iy + k)
+    return ([(x, iy - k) for x in xs] + [(x, iy + k) for x in xs]
+            + [(ix - k, y) for y in ys] + [(ix + k, y) for y in ys])
+
+
+class _GapSearch:
+    """The nearest vertex or segment to a loose run end, for close_gaps.
+
+    Up to 1.2.1 the search looked at the 3 × 3 cells round the end, cells of
+    ``gap`` for vertices and of 12 pt for segments — on a dense sheet some
+    thousands of segments for every end (40 s on an A0 Revit plan). Here
+    vertices lie in cells of at most 1 pt and segments in 2 pt cells along
+    their length; the cells are searched nearest ring first, until nothing
+    nearer can come.
+
+    The answers stay exactly those of the old search. It saw every point
+    where it lay at the start (``moved`` keeps that for the ends moved
+    since) and, of equal distances, kept the first it met: in its cell
+    order for vertices, in the order of a set for segments — on such a tie
+    the old segment search is asked itself (``_old_segment``)."""
+
+    SCELL = 2.0           # segment cells, points
+    OLD_SCELL = 12.0      # the old segment cells (at least)
+
+    def __init__(self, runs, gap):
+        self.runs = runs
+        self.gap = gap
+        self.vcell = min(gap, 1.0)
+        self.moved = {}                # (ri, end) -> where that end lay first
+        self.vgrid = {}
+        self.sgrid = {}
+        self.old = None                # the old segment grid, built when needed
+        self.oldcell = max(gap, self.OLD_SCELL)
+        # The old segment search reached at least ``oldcell`` round the end;
+        # a segment within ``gap`` whose ends moved by less than ``gap`` lay
+        # within 2 × gap at the start — inside, unless the gap is large.
+        self.check_window = 2.0 * gap > self.oldcell
+        vc = self.vcell
+        vgrid = self.vgrid
+        get = vgrid.get
+        register = self._register
+        for ri, (r, _c) in enumerate(runs):
+            px = py = 0.0
+            for pi, (x, y) in enumerate(r):
+                k = (int(x // vc), int(y // vc))
+                lst = get(k)
+                if lst is None:
+                    vgrid[k] = [(ri, pi)]
+                else:
+                    lst.append((ri, pi))
+                if pi:
+                    register((ri, pi - 1), px, py, x, y)
+                px, py = x, y
+
+    def _register(self, item, ax, ay, bx, by):
+        """Segment ``item`` into every segment cell it passes through."""
+        sc = self.SCELL
+        eps = 1e-7
+        lx, hx = (ax, bx) if ax <= bx else (bx, ax)
+        ly, hy = (ay, by) if ay <= by else (by, ay)
+        gx0, gx1 = int((lx - eps) // sc), int((hx + eps) // sc)
+        gy0, gy1 = int((ly - eps) // sc), int((hy + eps) // sc)
+        nx, ny = gx1 - gx0, gy1 - gy0
+        if nx == 0 or ny == 0 or (nx + 1) * (ny + 1) <= 6:
+            cells = [(gx, gy) for gx in range(gx0, gx1 + 1)
+                     for gy in range(gy0, gy1 + 1)]
+        elif nx >= ny:                    # column by column
+            if ax > bx:
+                ax, ay, bx, by = bx, by, ax, ay
+            s = (by - ay) / (bx - ax)
+            cells = []
+            for gx in range(gx0, gx1 + 1):
+                xl = max(gx * sc, ax)
+                xr = max(xl, min(gx * sc + sc, bx))
+                yl = ay + (xl - ax) * s
+                yr = ay + (xr - ax) * s
+                if yl > yr:
+                    yl, yr = yr, yl
+                cells += [(gx, gy) for gy in range(int((yl - eps) // sc),
+                                                   int((yr + eps) // sc) + 1)]
+        else:                             # row by row
+            if ay > by:
+                ax, ay, bx, by = bx, by, ax, ay
+            s = (bx - ax) / (by - ay)
+            cells = []
+            for gy in range(gy0, gy1 + 1):
+                yl = max(gy * sc, ay)
+                yr = max(yl, min(gy * sc + sc, by))
+                xl = ax + (yl - ay) * s
+                xr = ax + (yr - ay) * s
+                if xl > xr:
+                    xl, xr = xr, xl
+                cells += [(gx, gy) for gx in range(int((xl - eps) // sc),
+                                                   int((xr + eps) // sc) + 1)]
+        grid = self.sgrid
+        get = grid.get
+        for c in cells:
+            lst = get(c)
+            if lst is None:
+                grid[c] = [item]
+            else:
+                lst.append(item)
+
+    def move(self, ri, end, pt):
+        """Run ``ri``'s end ``end`` (an index: 0 or the last) onto ``pt``."""
+        r = self.runs[ri][0]
+        self.moved.setdefault((ri, end), r[end])
+        r[end] = pt
+        vc = self.vcell
+        k = (int(pt[0] // vc), int(pt[1] // vc))
+        lst = self.vgrid.get(k)
+        if lst is None:
+            self.vgrid[k] = [(ri, end)]
+        else:
+            lst.append((ri, end))
+        si = 0 if end == 0 else len(r) - 2
+        a, b = r[si], r[si + 1]
+        self._register((ri, si), a[0], a[1], b[0], b[1])
+
+    def nearest_vertex(self, ri, end, pt):
+        """The vertex the old search moved this end onto, or None."""
+        gap, vc = self.gap, self.vcell
+        px, py = pt
+        runs, moved, get = self.runs, self.moved, self.vgrid.get
+        n = len(runs[ri][0])
+        ox, oy = int(px // gap) - 1, int(py // gap) - 1   # the old 3 × 3 block
+        ix, iy = int(px // vc), int(py // vc)
+        hypot = math.hypot
+        best = bkey = None
+        bd = gap
+        k = 0
+        while True:
+            if k:
+                lb = min(px - (ix - k + 1) * vc, (ix + k) * vc - px,
+                         py - (iy - k + 1) * vc, (iy + k) * vc - py) - 1e-9
+                if lb >= gap or (best is not None and lb > bd):
+                    break
+                cells = _ring(ix, iy, k)
+            else:
+                cells = ((ix, iy),)
+            for c in cells:
+                for rj, pj in get(c, ()):
+                    if rj == ri and (pj == end
+                                     or (n <= 2 and abs(pj - end) <= 1)):
+                        continue                # itself, its own other end
+                    q = runs[rj][0][pj]
+                    d = hypot(q[0] - px, q[1] - py)
+                    if not 1e-9 < d <= bd or (d == bd and best is None):
+                        continue
+                    o = moved.get((rj, pj), q)  # where the old search saw it
+                    cx, cy = int(o[0] // gap) - ox, int(o[1] // gap) - oy
+                    if not (0 <= cx <= 2 and 0 <= cy <= 2):
+                        continue
+                    key = (cx * 3 + cy, rj, pj)   # the order it met them in
+                    if d < bd or key < bkey:
+                        best, bd, bkey = q, d, key
+            k += 1
+        return best
+
+    def nearest_segment(self, ri, pt):
+        """``(rj, sj, t, foot)``: the straight segment of another run the old
+        search moved this end onto, or None."""
+        gap, sc = self.gap, self.SCELL
+        px, py = pt
+        runs, get = self.runs, self.sgrid.get
+        hypot = math.hypot
+        best = None
+        bd = gap
+        tie = False
+        ix, iy = int(px // sc), int(py // sc)
+        if gap <= sc:                 # the cells under the box round the end
+            g = gap + 1e-7
+            box = [(cx, cy)
+                   for cx in range(int((px - g) // sc), int((px + g) // sc) + 1)
+                   for cy in range(int((py - g) // sc), int((py + g) // sc) + 1)]
+        else:
+            box = None
+        k = 0
+        while True:
+            if box is not None:
+                if k:
+                    break
+                cells = box
+            elif k:
+                lb = min(px - (ix - k + 1) * sc, (ix + k) * sc - px,
+                         py - (iy - k + 1) * sc, (iy + k) * sc - py) - 1e-9
+                if lb >= gap or (best is not None and lb > bd):
+                    break
+                cells = _ring(ix, iy, k)
+            else:
+                cells = ((ix, iy),)
+            for c in cells:
+                for rj, sj in get(c, ()):
+                    if rj == ri:
+                        continue
+                    r = runs[rj][0]
+                    a, b = r[sj], r[sj + 1]
+                    dx, dy = b[0] - a[0], b[1] - a[1]
+                    L2 = dx * dx + dy * dy
+                    if L2 <= 1e-12:
+                        continue
+                    t = ((px - a[0]) * dx + (py - a[1]) * dy) / L2
+                    if t <= 0.0 or t >= 1.0:
+                        continue
+                    fx, fy = a[0] + t * dx, a[1] + t * dy
+                    d = hypot(fx - px, fy - py)
+                    if 1e-9 < d < bd:
+                        best, bd, tie = (rj, sj, t, (fx, fy)), d, False
+                    elif d == bd and best is not None and \
+                            (rj != best[0] or sj != best[1]):
+                        tie = True
+            k += 1
+        if best is not None and (tie or (self.check_window
+                                         and not self._in_old_window(best, pt))):
+            return self._old_segment(ri, pt)
+        return best
+
+    def _first(self, rj, pj):
+        """Where vertex ``pj`` of run ``rj`` lay at the start."""
+        return self.moved.get((rj, pj), self.runs[rj][0][pj])
+
+    def _in_old_window(self, seg, pt):
+        """Did the old search see segment ``seg`` from ``pt``?"""
+        sc = self.oldcell
+        a, b = self._first(seg[0], seg[1]), self._first(seg[0], seg[1] + 1)
+        sx, sy = int(pt[0] // sc), int(pt[1] // sc)
+        x0, x1 = sorted((a[0], b[0]))
+        y0, y1 = sorted((a[1], b[1]))
+        return (int(x0 // sc) <= sx + 1 and int(x1 // sc) >= sx - 1
+                and int(y0 // sc) <= sy + 1 and int(y1 // sc) >= sy - 1)
+
+    def _old_segment(self, ri, pt):
+        """The segment search of 1.2.1, unchanged — for ties and far moves."""
+        sc = self.oldcell
+        if self.old is None:
+            grid = self.old = {}
+            for rj, (r, _c) in enumerate(self.runs):
+                for sj in range(len(r) - 1):
+                    a, b = self._first(rj, sj), self._first(rj, sj + 1)
+                    x0, x1 = sorted((a[0], b[0]))
+                    y0, y1 = sorted((a[1], b[1]))
+                    for gx in range(int(x0 // sc), int(x1 // sc) + 1):
+                        for gy in range(int(y0 // sc), int(y1 // sc) + 1):
+                            grid.setdefault((gx, gy), []).append((rj, sj))
+        bseg, bd = None, self.gap
+        sx, sy = int(pt[0] // sc), int(pt[1] // sc)
+        near = set()
+        for ax in (sx - 1, sx, sx + 1):
+            for ay in (sy - 1, sy, sy + 1):
+                near.update(self.old.get((ax, ay), ()))
+        for rj, sj in near:
+            if rj == ri:
+                continue
+            a, b = self.runs[rj][0][sj], self.runs[rj][0][sj + 1]
+            dx, dy = b[0] - a[0], b[1] - a[1]
+            L2 = dx * dx + dy * dy
+            if L2 <= 1e-12:
+                continue
+            t = ((pt[0] - a[0]) * dx + (pt[1] - a[1]) * dy) / L2
+            if t <= 0.0 or t >= 1.0:
+                continue
+            fx, fy = a[0] + t * dx, a[1] + t * dy
+            d = math.hypot(fx - pt[0], fy - pt[1])
+            if 1e-9 < d < bd:
+                bseg, bd = (rj, sj, t, (fx, fy)), d
+        return bseg
+
+
 def close_gaps(runs, gap):
     """Loose run ends (a point no other run shares) within ``gap`` points
     of another vertex are moved onto it; failing that, onto the nearest
@@ -253,31 +525,9 @@ def close_gaps(runs, gap):
         return runs, 0
     runs = [(list(r), c) for r, c in runs]
     q = 1e-3
-
-    def key(pt):
-        return (round(pt[0] / q), round(pt[1] / q))
-
-    count = {}
-    for r, _c in runs:
-        for pt in r:
-            count[key(pt)] = count.get(key(pt), 0) + 1
-    cell = gap
-    grid = {}
-    for ri, (r, _c) in enumerate(runs):
-        for pi, pt in enumerate(r):
-            grid.setdefault((int(pt[0] // cell), int(pt[1] // cell)),
-                            []).append((ri, pi))
-    # segments in coarser cells (a long line spans few of them); the cells
-    # are at least as big as the gap, so the 3 × 3 around an end suffice
-    scell = max(gap, 12.0)
-    seg_grid = {}
-    for ri, (r, _c) in enumerate(runs):
-        for si, (a, b) in enumerate(zip(r, r[1:])):
-            x0, x1 = sorted((a[0], b[0]))
-            y0, y1 = sorted((a[1], b[1]))
-            for gx in range(int(x0 // scell), int(x1 // scell) + 1):
-                for gy in range(int(y0 // scell), int(y1 // scell) + 1):
-                    seg_grid.setdefault((gx, gy), []).append((ri, si))
+    count = Counter((round(x / q), round(y / q))
+                    for r, _c in runs for x, y in r)
+    search = _GapSearch(runs, gap)
     closed = 0
     splits = {}                     # ri -> [(si, t, point)]
     for ri, (r, _c) in enumerate(runs):
@@ -285,53 +535,23 @@ def close_gaps(runs, gap):
             continue
         for end in (0, len(r) - 1):
             pt = r[end]
-            if count.get(key(pt), 0) > 1:
+            if count.get((round(pt[0] / q), round(pt[1] / q)), 0) > 1:
                 continue                         # already connected
-            gx, gy = int(pt[0] // cell), int(pt[1] // cell)
-            best, bd = None, gap
-            for ax in (gx - 1, gx, gx + 1):
-                for ay in (gy - 1, gy, gy + 1):
-                    for rj, pj in grid.get((ax, ay), ()):
-                        if rj == ri and pj == end:
-                            continue
-                        if rj == ri and abs(pj - end) <= 1 and len(r) <= 2:
-                            continue             # its own other end
-                        qpt = runs[rj][0][pj]
-                        d = math.hypot(qpt[0] - pt[0], qpt[1] - pt[1])
-                        if 1e-9 < d < bd:
-                            best, bd = qpt, d
+            best = search.nearest_vertex(ri, end, pt)
             if best is not None:
-                r[end] = best
-                count[key(best)] = count.get(key(best), 0) + 1
+                search.move(ri, end, best)
+                k = (round(best[0] / q), round(best[1] / q))
+                count[k] = count.get(k, 0) + 1
                 closed += 1
                 continue
             # onto the nearest segment of another run
-            bseg, bd = None, gap
-            sx, sy = int(pt[0] // scell), int(pt[1] // scell)
-            near = set()
-            for ax in (sx - 1, sx, sx + 1):
-                for ay in (sy - 1, sy, sy + 1):
-                    near.update(seg_grid.get((ax, ay), ()))
-            for rj, sj in near:
-                if rj == ri:
-                    continue
-                a, b = runs[rj][0][sj], runs[rj][0][sj + 1]
-                dx, dy = b[0] - a[0], b[1] - a[1]
-                L2 = dx * dx + dy * dy
-                if L2 <= 1e-12:
-                    continue
-                t = ((pt[0] - a[0]) * dx + (pt[1] - a[1]) * dy) / L2
-                if t <= 0.0 or t >= 1.0:
-                    continue
-                fx, fy = a[0] + t * dx, a[1] + t * dy
-                d = math.hypot(fx - pt[0], fy - pt[1])
-                if 1e-9 < d < bd:
-                    bseg, bd = (rj, sj, t, (fx, fy)), d
+            bseg = search.nearest_segment(ri, pt)
             if bseg is not None:
                 rj, sj, t, fp = bseg
-                r[end] = fp
+                search.move(ri, end, fp)
                 splits.setdefault(rj, []).append((sj, t, fp))
-                count[key(fp)] = count.get(key(fp), 0) + 2
+                k = (round(fp[0] / q), round(fp[1] / q))
+                count[k] = count.get(k, 0) + 2
                 closed += 1
     for rj, lst in splits.items():
         r, c = runs[rj]
