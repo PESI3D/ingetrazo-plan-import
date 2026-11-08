@@ -206,6 +206,48 @@ def page_info(path) -> list:
 _SCALE_LINE = re.compile(r"^(.*?)[\s\t]*\bM?\s*1\s*:\s*(\d{1,5})\s*$")
 _SCALE_ANY = re.compile(r"\b1\s*:\s*(\d{1,5})\b")
 
+# Imperial plan scales: architectural «1/4" = 1'-0"», «1 1/2" = 1'-0"»,
+# engineering «1" = 20'» → the same 1:N (1/4" = 1'-0" is 1:48).
+_IN_MARK = r"(?:\"|”|″|''|in\.?)"
+_FT_MARK = r"(?:'|’|′|ft\.?)"
+_IMP_SCALE = re.compile(
+    r"(\d{1,2}\s*[- ]\s*\d{1,2}\s*/\s*\d{1,2}|\d{1,2}\s*/\s*\d{1,3}|\d{1,2})"
+    r"\s*" + _IN_MARK + r"\s*=\s*(\d{1,4})\s*" + _FT_MARK
+    + r"(?:\s*-?\s*0\s*" + _IN_MARK + r"?)?", re.I)
+
+
+def _inch_value(txt):
+    """«1/4», «1 1/2», «1-1/2», «3» → inches."""
+    txt = txt.strip()
+    m = re.match(r"^(\d+)\s*[- ]\s*(\d+)\s*/\s*(\d+)$", txt)
+    if m:
+        return int(m.group(1)) + int(m.group(2)) / max(1, int(m.group(3)))
+    m = re.match(r"^(\d+)\s*/\s*(\d+)$", txt)
+    if m:
+        return int(m.group(1)) / max(1, int(m.group(2)))
+    return float(txt)
+
+
+def imperial_scale(text):
+    """1:N of the first imperial scale in ``text`` — or None."""
+    for m in _IMP_SCALE.finditer(text or ""):
+        try:
+            inch = _inch_value(m.group(1))
+            n = int(m.group(2)) * 12.0 / inch if inch > 0 else 0
+        except (ValueError, ZeroDivisionError):
+            continue
+        if 1.0 <= n <= 20000:
+            return int(round(n))
+    return None
+
+
+def _scale_in(text):
+    """1:N of a metric «1:100» or an imperial «1/4" = 1'-0"» scale."""
+    m = _SCALE_ANY.search(text or "")
+    if m and int(m.group(1)) > 1:
+        return int(m.group(1))
+    return imperial_scale(text)
+
 
 @dataclass
 class PageText:
@@ -226,8 +268,18 @@ def _title_from(text):
             name = " ".join(mt.group(1).split())
             scale = int(mt.group(2))
             break
+        mi = _IMP_SCALE.search(line)
+        if mi and imperial_scale(line):
+            head = re.sub(r"(?i)\bscale\s*:?\s*$", "",
+                          line[:mi.start()]).strip(" :-–")
+            if len(head) >= 3:
+                name = " ".join(head.split())
+                scale = imperial_scale(line)
+                break
     if scale is None:
         found = [int(v) for v in _SCALE_ANY.findall(text) if int(v) > 1]
+        found += [n for n in (imperial_scale(ln) for ln in text.splitlines())
+                  if n]
         if found:
             scale = max(set(found), key=found.count)
     return name, scale
@@ -259,7 +311,8 @@ def page_texts(path, page_index: int, reader=None) -> tuple:
         k = math.hypot(a, b) or 1.0
         items.append(PageText(m[4], m[5], abs(float(size or 0)) * k,
                               math.degrees(math.atan2(b, a)), t,
-                              bool(_SCALE_ANY.search(t))))
+                              bool(_SCALE_ANY.search(t)
+                                   or imperial_scale(t))))
 
     try:
         text = _extract_text(reader, page, visit, items) or ""
@@ -494,6 +547,70 @@ _LEVEL_ONLY = re.compile(r"^" + _LEVEL_NUM + r"$")
 _LEVEL_REL_ABS = re.compile(r"^" + _LEVEL_NUM + r"\s*=\s*[+\-−±]?\s?\d")
 _STORY_LABEL = re.compile(r"^(-?\d{1,2})\s+(\S.{0,30})$")
 
+# Imperial plans: levels in feet and inches «+10'-6"», «EL. 12'-0 1/2"»,
+# «±0'-0"» — read as feet (the level unit of such a set).
+_EL_PREFIX = r"(?:(?:EL(?:EV)?\.?|T\.?O\.?(?:\s*[A-Z]+)?\.?|F\.?F\.?[EL]?\.?)\s*:?\s*)?"
+_LEVEL_FTIN = re.compile(
+    r"^" + _EL_PREFIX + r"(±|[+\-−])?\s?(\d{1,4})\s*" + _FT_MARK
+    + r"\s*-?\s*(?:(\d{1,2})(?:\s*[- ]\s*(\d{1,2})\s*/\s*(\d{1,2}))?"
+    r"|(\d{1,2})\s*/\s*(\d{1,2}))?\s*" + _IN_MARK + r"?$", re.I)
+_LEVEL_DEC = re.compile(r"^" + _EL_PREFIX + _LEVEL_NUM + r"\s*" + _FT_MARK
+                        + r"?$", re.I)
+# A feet-and-inches dimension anywhere: «12'-6"», «3' - 4 1/2"».
+_FTIN_ANY = re.compile(r"\d\s*" + _FT_MARK + r"\s*-?\s*\d{1,2}(?:\s*[- ]\s*\d"
+                       r"{1,2}\s*/\s*\d{1,2})?\s*(?:\"|”|″|'')")
+_STORY_EN = re.compile(
+    r"^(?:(?:basement|cellar|ground|first|second|third|fourth|fifth|sixth|"
+    r"\d{1,2}(?:st|nd|rd|th))\s+(?:floor|level|story|storey)|"
+    r"(?:level|floor|story|storey)\s*\d{1,2}|basement|cellar|attic|"
+    r"mezzanine|roof|penthouse)\b.{0,24}$", re.I)
+
+
+def level_value(text):
+    """The number of a level text, in the unit it is written in (metres
+    «+3,00», feet «+10'-6"» / «EL. 10.50'») — or None."""
+    t = (text or "").strip()
+    m = _LEVEL_ONLY.match(t)
+    if m:
+        return _level_value(m)
+    m = _LEVEL_FTIN.match(t)
+    if m and (m.group(3) is not None or re.search(_FT_MARK, t)):
+        sign = m.group(1)
+        ft = int(m.group(2))
+        inch = 0.0
+        if m.group(3):
+            inch = int(m.group(3))
+            if m.group(4) and m.group(5):
+                inch += int(m.group(4)) / max(1, int(m.group(5)))
+        elif m.group(6) and m.group(7):
+            inch = int(m.group(6)) / max(1, int(m.group(7)))
+        v = ft + inch / 12.0
+        return -v if sign in ("-", "−") else v
+    m = _LEVEL_DEC.match(t)
+    if m:
+        return _level_value(m)
+    return None
+
+
+def plan_unit(texts_by_page):
+    """«imperial» when the sheets are written in feet and inches (scales
+    «1/4" = 1'-0"», dimensions «12'-6"»), «metric» for «1:100» sets —
+    None when nothing tells."""
+    imp = met = 0
+    for texts in texts_by_page.values():
+        for t in texts:
+            s = t.text or ""
+            if imperial_scale(s) or _FTIN_ANY.search(s) \
+                    or _LEVEL_FTIN.match(s.strip()) and "'" in s:
+                imp += 1
+            elif _SCALE_ANY.search(s) or _LEVEL_ONLY.match(s.strip()):
+                met += 1
+    if imp >= 3 and imp > met:
+        return "imperial"
+    if met:
+        return "metric"
+    return "imperial" if imp else None
+
 _ABBR = (("untergeschoss", "ug"), ("kellergeschoss", "kg"),
          ("gartengeschoss", "gg"), ("souterrain", "sg"),
          ("sockelgeschoss", "sg"), ("erdgeschoss", "eg"),
@@ -508,9 +625,29 @@ def _level_value(m) -> float:
     return -v if sign in ("-", "−") else v
 
 
+_ORD = (("first", "1"), ("second", "2"), ("third", "3"), ("fourth", "4"),
+        ("fifth", "5"), ("sixth", "6"), ("seventh", "7"), ("eighth", "8"))
+
+
 def story_key(name: str) -> str:
-    """«1. Obergeschoss», «1. OG», «1.OG» → «1og»; «Erdgeschoss» → «eg»."""
+    """«1. Obergeschoss», «1. OG», «1.OG» → «1og»; «Erdgeschoss» → «eg»;
+    «Second Floor Plan», «2nd floor», «Level 2», «Floor 2» → «fl2»."""
     s = (name or "").lower()
+    en = re.search(r"\b(floor|level|story|storey|basement|cellar|ground|"
+                   r"attic|mezzanine|penthouse)\b", s)
+    if en and not any(long in s for long, _sh in _ABBR):
+        s = re.sub(r"\b(plan|plans|layout|drawing)\b", " ", s)
+        for word, num in _ORD:
+            s = re.sub(r"\b" + word + r"\b", num, s)
+        s = re.sub(r"\b(\d+)(st|nd|rd|th)\b", r"\1", s)
+        if re.search(r"\b(basement|cellar)\b", s):
+            return "flb"
+        if re.search(r"\bground\b", s):
+            return "flg"
+        m = re.search(r"\b(\d{1,2})\b", s)
+        if m and re.search(r"\b(floor|level|story|storey)\b", s):
+            return "fl" + m.group(1)
+        return re.sub(r"[^a-z0-9]", "", s)
     for long, short in _ABBR:
         s = s.replace(long, short)
     return re.sub(r"[^a-z0-9]", "", s)
@@ -521,28 +658,41 @@ def _is_storey_name(name) -> bool:
     s = (name or "").lower()
     if any(long in s for long, _short in _ABBR) or "geschoss" in s:
         return True
+    if re.search(r"\b(floor|level|story|storey|basement|cellar|attic|"
+                 r"mezzanine|penthouse)\b", s) and not re.search(
+                     r"\b(section|elevation|detail|site|roof)\b", s):
+        return True
     return bool(re.search(r"\b(ug|kg|gg|eg|og|dg|sg)\b", s))
 
 
 def story_levels(texts) -> list:
     """Story markers as CAD sections/elevations print them — a level above
     a label «-1 GG», «0 EG», «1 1. OG» — as ``[(label, level_m)]``."""
-    levels = [(t, _LEVEL_ONLY.match(t.text.strip())) for t in texts]
-    levels = [(t, m) for t, m in levels if m]
+    levels = [(t, level_value(t.text)) for t in texts]
+    levels = [(t, v) for t, v in levels if v is not None]
     out = []
     for t in texts:
-        ml = _STORY_LABEL.match(t.text.strip())
-        if not ml or _LEVEL_ONLY.match(t.text.strip()):
+        txt = t.text.strip()
+        if level_value(txt) is not None:
+            continue
+        ml = _STORY_LABEL.match(txt)
+        en = None if ml else _STORY_EN.match(txt)
+        if not ml and not en:
             continue
         best = None
-        for lv, m in levels:
+        for lv, v in levels:
             dx = abs(lv.x - t.x)
             dy = lv.y - t.y
-            if dx < 3 * t.size and 0 < dy < 2.5 * max(t.size, 1.0):
-                if best is None or dy < best[0]:
-                    best = (dy, _level_value(m))
+            # German sections: the level above its label; US elevation
+            # markers: «LEVEL 2» with «EL. 12'-0"» above, below or beside
+            near = (0 < dy < 2.5 * max(t.size, 1.0)) if ml else (
+                abs(dy) < 2.5 * max(t.size, 1.0) and dx < 12 * t.size)
+            if dx < (3 if ml else 12) * t.size and near:
+                d = abs(dy) + 0.1 * dx
+                if best is None or d < best[0]:
+                    best = (d, v)
         if best is not None:
-            out.append((ml.group(2).strip(), best[1]))
+            out.append(((ml.group(2) if ml else txt).strip(), best[1]))
     return out
 
 
@@ -551,9 +701,15 @@ def page_level(texts):
     the most frequent one — or None."""
     found = {}
     for t in texts:
-        m = _LEVEL_REL_ABS.match(t.text.strip())
+        txt = t.text.strip()
+        m = _LEVEL_REL_ABS.match(txt)
+        v = None
         if m:
-            v = round(_level_value(m), 2)
+            v = _level_value(m)
+        elif "=" in txt and "'" in txt:
+            v = level_value(txt.split("=", 1)[0])
+        if v is not None:
+            v = round(v, 3)
             found[v] = found.get(v, 0) + 1
     if not found:
         return None

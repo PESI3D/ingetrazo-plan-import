@@ -35,8 +35,12 @@ _TITLE_WORDS = re.compile(
     r"planinhalt|plan\s*inhalt|gezeichnet|geprüft|gepr\.|datum|index|"
     r"architekt|entwurfsverfasser|maßstab|massstab|format|blatt|"
     r"änderung|aenderung|client|project|drawing\s*no|drawn|checked|"
-    r"revision|date|sheet", re.I)
+    r"revision|date|sheet|scale|owner|architect|job\s*no|title", re.I)
 _LEVEL = re.compile(r"^(±|[+\-−])?\s?\d{1,3}[,.]\d{2}")
+# imperial level markers: «+10'-6"», «EL. 12'-0"»
+_LEVEL_FTIN = re.compile(
+    r"^(?:EL(?:EV)?\.?\s*:?\s*)?(±|[+\-−])?\s?\d{1,4}\s*['’′]\s*-?\s*\d",
+    re.I)
 
 
 def _segments(runs):
@@ -334,7 +338,8 @@ def suggest_crops(width, height, runs, texts=()):
         x0, y0, x1, y1 = bx
         hgt = y1 - y0
         for t in texts:
-            if not _LEVEL.match((t.text or "").strip()):
+            tt = (t.text or "").strip()
+            if not (_LEVEL.match(tt) or _LEVEL_FTIN.match(tt)):
                 continue
             if not (y0 - 0.05 * hgt <= t.y <= y1 + 0.05 * hgt):
                 continue

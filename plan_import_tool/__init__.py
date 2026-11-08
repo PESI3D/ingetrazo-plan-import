@@ -101,7 +101,7 @@ from pathlib import Path
 
 KEY = "plan_import_tool"
 TITLE = "Plan Import"
-VERSION = "1.2.1"
+VERSION = "1.3"
 SETTINGS_KEY = "plugins/plan_import_tool/params"
 WHITE = 0.97          # r, g and b all above this = white (paper masks)
 GAP = 0.1             # side by side: gap between sheets, × sheet width
@@ -113,7 +113,65 @@ def default_params() -> dict:
             "floor_h": 3.0, "base_z": 0.0, "view_dist": 5.0,
             "to_levels": True, "to_layers": True,
             "min_part_mm": 0.0, "min_width_mm": 0.0, "skip_hatch": False,
-            "skip_colours": [], "dedupe": True, "gap_mm": 5.0}
+            "skip_colours": [], "dedupe": True, "gap_mm": 5.0,
+            "level_unit": "auto"}
+
+#: The unit the storey levels are WRITTEN in on the plans (German plans:
+#: metres, «+3,00»; US plans: feet and inches, «+10'-6"»). «Automatic»
+#: takes it from the plans themselves — the others are only for the odd
+#: set that needs converting.
+LEVEL_UNITS = (("auto", "Automatic (from the plans)", None),
+               ("m", "m (as written: +3,00)", 1.0),
+               ("cm", "cm", 0.01), ("mm", "mm", 0.001),
+               ("ft", "ft", 0.3048), ("in", "in", 0.0254))
+
+
+def _len_field(parent, lo, hi, dec, value, step=None):
+    """A length field: the document's units (value() in metres) — or, on
+    older IngeTrazo builds, a plain field in metres."""
+    from PySide6.QtWidgets import QDoubleSpinBox
+    U = _pesi3d_units()
+    if U:
+        sp = U["Length"](parent, minimum=lo, maximum=hi)
+    else:
+        sp = QDoubleSpinBox(parent)
+        sp.setRange(lo, hi)
+        sp.setDecimals(dec)
+        sp.setSuffix(" m")
+        if step:
+            sp.setSingleStep(step)
+    sp.setValue(value)
+    return sp
+
+
+def _imperial_label(n):
+    """« (1/4\" = 1'-0\")» for the 1:N of a common imperial scale."""
+    try:
+        n = int(n)
+    except (TypeError, ValueError):
+        return ""
+    from fractions import Fraction
+    if n in (8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 384):
+        f = Fraction(12, n)
+        txt = (f"{f.numerator}/{f.denominator}" if f.denominator > 1
+               else str(f.numerator))
+        if f > 1 and f.denominator > 1:
+            w = f.numerator // f.denominator
+            r = f - w
+            txt = f"{w} {r.numerator}/{r.denominator}"
+        return f' ({txt}" = 1\'-0")'
+    if n % 12 == 0 and n >= 120:
+        return f' (1" = {n // 12}\')'
+    return ""
+
+
+def _len_txt(v, signed=False):
+    """A model length as text in the document's units."""
+    U = _pesi3d_units()
+    if U:
+        t = U["len"](v)
+        return ("+" + t) if signed and v > 0.0005 else t
+    return (f"{v:+.2f} m" if signed else f"{v:.2f} m")
 
 
 #: Options the imported linework depends on (cache keys, preview state).
@@ -671,6 +729,7 @@ def _make_dialog_class():
             self._vec = {}               # page index -> PageVectors
             self._built = {}             # build key -> Group
             self._texts = {}             # page index -> [PageText]
+            self._plan_unit = None       # «metric» / «imperial» / None
             self._images = {}            # page index -> QImage (few)
             self._shown = None           # page index in the page view
             self._rowpage = []           # table row -> page index
@@ -851,18 +910,11 @@ def _make_dialog_class():
             grp = QButtonGroup(self)
             grp.addButton(self.rb_side)
             grp.addButton(self.rb_stack)
-            self.sp_floor = QDoubleSpinBox(self)
-            self.sp_floor.setRange(0.0, 100.0)
-            self.sp_floor.setDecimals(2)
-            self.sp_floor.setSingleStep(0.25)
-            self.sp_floor.setSuffix(" m")
-            self.sp_floor.setValue(float(self.p.get("floor_h", 3.0)))
+            self.sp_floor = _len_field(self, 0.0, 100.0, 2,
+                                       float(self.p.get("floor_h", 3.0)), 0.25)
             self.sp_floor.setToolTip("Default storey height for Stacked.")
-            self.sp_base = QDoubleSpinBox(self)
-            self.sp_base.setRange(-10_000.0, 10_000.0)
-            self.sp_base.setDecimals(2)
-            self.sp_base.setSuffix(" m")
-            self.sp_base.setValue(float(self.p.get("base_z", 0.0)))
+            self.sp_base = _len_field(self, -10_000.0, 10_000.0, 2,
+                                      float(self.p.get("base_z", 0.0)))
             self.sp_base.setToolTip("Elevation of the first ticked page "
                                     "(e.g. -3.00 m for a basement).")
             self.btn_fill = QPushButton("Fill elevations", self)
@@ -872,11 +924,8 @@ def _make_dialog_class():
                 "+ Floor height (the first: Base). Edit single rows "
                 "afterwards.")
             self.btn_fill.clicked.connect(self._fill_elevations)
-            self.sp_dist = QDoubleSpinBox(self)
-            self.sp_dist.setRange(0.0, 1000.0)
-            self.sp_dist.setDecimals(2)
-            self.sp_dist.setSuffix(" m")
-            self.sp_dist.setValue(float(self.p.get("view_dist", 5.0)))
+            self.sp_dist = _len_field(self, 0.0, 1000.0, 2,
+                                      float(self.p.get("view_dist", 5.0)))
             self.sp_dist.setToolTip(
                 "Stacked: elevations and sections stand upright this far "
                 "outside the floor plans (a second view on the same side "
@@ -888,6 +937,30 @@ def _make_dialog_class():
                 self.btn_fill, QLabel("   View distance:", self),
                 self.sp_dist))
             self.rb_stack.toggled.connect(self._stack_toggled)
+            self.cb_lunit = QComboBox(self)
+            for code, label, _f in LEVEL_UNITS:
+                self.cb_lunit.addItem(label, code)
+            self.cb_lunit.setCurrentIndex(max(0, self.cb_lunit.findData(
+                # «m» was the old default: it is what «Automatic» reads
+                # off a metric set anyway
+                self.p.get("level_unit", "auto")
+                if self.p.get("level_unit") not in (None, "m") else "auto")))
+            self.cb_lunit.setToolTip(
+                "The unit the storey levels are written in on the plans. "
+                "Automatic: read from the plans — metric sets «+3,00» in "
+                "metres, imperial sets «+10'-6\"» in feet and inches. Pick "
+                "a unit only when a set needs converting.")
+            self.cb_lunit.currentIndexChanged.connect(self._lunit_changed)
+            self.cb_docunit = QCheckBox("", self)
+            self.cb_docunit.setChecked(True)
+            self.cb_docunit.setVisible(False)
+            self.cb_docunit.setToolTip(
+                "The plans are drawn in another unit than this document: "
+                "work on in the plans' unit (the document's units, "
+                "Preferences ▸ Units, are switched when the sheets are "
+                "imported — lengths themselves do not change).")
+            form2.addRow("Levels on the plans in:", row_widget(
+                self.cb_lunit, self.cb_docunit))
 
             self.cb_strokes = QCheckBox("Lines (strokes)", self)
             self.cb_fills = QCheckBox("Filled shapes (outlines)", self)
@@ -944,13 +1017,19 @@ def _make_dialog_class():
                 "as fill AND stroke, double lines, overlapping pieces). "
                 "Every end point stays, so junctions keep their vertices.")
             self.cb_dedupe.toggled.connect(self._changed)
-            self.sp_gap = QDoubleSpinBox(self)
-            self.sp_gap.setRange(0.0, 500.0)
-            self.sp_gap.setDecimals(0)
-            self.sp_gap.setSingleStep(5.0)
-            self.sp_gap.setSuffix(" mm")
+            # REAL length (not paper): the document's units; kept in mm
+            self._gap_f = 1000.0 if _pesi3d_units() else 1.0
+            if _pesi3d_units():
+                self.sp_gap = _len_field(self, 0.0, 0.5, 3, 0.0)
+            else:
+                self.sp_gap = QDoubleSpinBox(self)
+                self.sp_gap.setRange(0.0, 500.0)
+                self.sp_gap.setDecimals(0)
+                self.sp_gap.setSingleStep(5.0)
+                self.sp_gap.setSuffix(" mm")
             self.sp_gap.setSpecialValueText("off")
-            self.sp_gap.setValue(float(self.p.get("gap_mm", 5.0) or 0.0))
+            self.sp_gap.setValue(
+                float(self.p.get("gap_mm", 5.0) or 0.0) / self._gap_f)
             self.sp_gap.setToolTip(
                 "Loose line ends closer than this (REAL millimetres, at the "
                 "row's scale) are joined to the nearest point — or onto the "
@@ -1028,9 +1107,10 @@ def _make_dialog_class():
             self.cb_fills.setChecked(bool(self.p["fills"]))
             self.cb_white.setChecked(bool(self.p["skip_white"]))
             for w, k in ((self.sp_small, "min_part_mm"),
-                         (self.sp_thin, "min_width_mm"),
-                         (self.sp_gap, "gap_mm")):
+                         (self.sp_thin, "min_width_mm")):
                 w.setValue(float(self.p.get(k) or 0.0))
+            self.sp_gap.setValue(float(self.p.get("gap_mm") or 0.0)
+                                 / self._gap_f)
             self.cb_hatch.setChecked(bool(self.p.get("skip_hatch")))
             self.cb_dedupe.setChecked(bool(self.p.get("dedupe", True)))
             self._sync_colour_btn()
@@ -1094,6 +1174,7 @@ def _make_dialog_class():
             self._want = []
             self._built = {}
             self._texts = {}
+            self._plan_unit = None
             self._images = {}
             self._shown = None
             self._levels = {}
@@ -1170,10 +1251,7 @@ def _make_dialog_class():
             sp.setFrame(False)
             sp.valueChanged.connect(self._scale_typed_sender)
             self.table.setCellWidget(r, COL_SCALE, sp)
-            el = QDoubleSpinBox()
-            el.setRange(-10_000, 10_000)
-            el.setDecimals(2)
-            el.setSuffix(" m")
+            el = _len_field(None, -10_000, 10_000, 2, 0.0)
             el.setFrame(False)
             el.valueChanged.connect(self._elev_edited)
             self.table.setCellWidget(r, COL_ELEV, el)
@@ -1378,7 +1456,8 @@ def _make_dialog_class():
                             int(scale))
                         self._busy = False
                         self._set_mark(rr, COL_SCALE, "sheet",
-                                       f"Read from the sheet: 1:{scale}.")
+                                       f"Read from the sheet: 1:{scale}"
+                                       f"{self._imp_scale(scale)}.")
                     if name:
                         self._set_mark(rr, COL_NAME, "sheet",
                                        "Drawing name read from the sheet.")
@@ -1408,13 +1487,14 @@ def _make_dialog_class():
             if name:
                 bits.append(name)
             if i in self._titles:
-                bits.append(f"scale on the sheet: 1:{scale}" if scale
+                bits.append(f"scale on the sheet: 1:{scale}"
+                            f"{self._imp_scale(scale)}" if scale
                             else "no scale found on the sheet")
             else:
                 bits.append("reading the texts…")
             if i in self._levels:
                 v, src = self._levels[i]
-                bits.append(f"level {self._fmt_level(v)} m ({src})")
+                bits.append(f"level {self._fmt_level(v)} ({src})")
             return " · ".join(bits)
 
         def _row_selected(self, r):
@@ -1917,11 +1997,21 @@ def _make_dialog_class():
             paper_mm = dist_pt * pv.PT_TO_MM
             sp = self.table.cellWidget(row, COL_SCALE)
             guess = paper_mm * sp.value() / 1000.0
-            real, ok = QInputDialog.getDouble(
-                self, f"{TITLE} — Measure scale",
-                f"Page {row + 1}: the distance is {paper_mm:.1f} mm on "
-                "paper.\nReal length of this distance (m):",
-                round(guess, 3), 0.001, 100000.0, 3)
+            U = _pesi3d_units()
+            if U:                          # typed in the document's units
+                txt, ok = QInputDialog.getText(
+                    self, f"{TITLE} — Measure scale",
+                    f"Page {row + 1}: the distance is {paper_mm:.1f} mm on "
+                    "paper.\nReal length of this distance (any unit, e.g. "
+                    "«3,65», «365 cm», «12'»):", text=U["len"](guess, True))
+                r = U["units"].parse(txt, "length") if ok else None
+                real = r.value if (r is not None and r.ok) else 0.0
+            else:
+                real, ok = QInputDialog.getDouble(
+                    self, f"{TITLE} — Measure scale",
+                    f"Page {row + 1}: the distance is {paper_mm:.1f} mm on "
+                    "paper.\nReal length of this distance (m):",
+                    round(guess, 3), 0.001, 100000.0, 3)
             if not ok or real <= 0:
                 self._measure_done("Measuring cancelled.")
                 return
@@ -1935,7 +2025,7 @@ def _make_dialog_class():
             self._busy = True
             sp.setValue(n)
             self._busy = False
-            tip = (f"Measured: {real:.3f} m = {paper_mm:.1f} mm on paper "
+            tip = (f"Measured: {_len_txt(real)} = {paper_mm:.1f} mm on paper "
                    f"→ 1:{exact:.1f}" + (f", set to 1:{n}" if
                                         abs(exact - n) > 0.05 else "") + ".")
             self._set_mark(row, COL_SCALE, "measured", tip)
@@ -1969,7 +2059,8 @@ def _make_dialog_class():
                 "min_width_mm": self.sp_thin.value(),
                 "skip_hatch": self.cb_hatch.isChecked(),
                 "dedupe": self.cb_dedupe.isChecked(),
-                "gap_mm": self.sp_gap.value(),
+                "gap_mm": self.sp_gap.value() * self._gap_f,
+                "level_unit": self.cb_lunit.currentData(),
             })
 
         def _rows(self):
@@ -2213,7 +2304,7 @@ def _make_dialog_class():
                 lvl = self.table.item(r, COL_LEVEL)
                 if k in self._levels and ptype == "Floor plan":
                     v, src = self._levels[k]
-                    lvl.setText(f"{self._fmt_level(v)} m")
+                    lvl.setText(self._fmt_level(v))
                     self._set_mark(r, COL_LEVEL, "sheet",
                                    f"Read from the sheets: {src}.")
                 elif ptype != "Floor plan":
@@ -2248,7 +2339,8 @@ def _make_dialog_class():
                     # section / elevation / site plan: not a storey
                     self.table.cellWidget(r, COL_ELEV).setValue(0.0)
                     self._set_mark(r, COL_ELEV, None,
-                                   "Not a floor plan — placed at 0 m.")
+                                   "Not a floor plan — placed at "
+                                   f"{_len_txt(0.0)}.")
                     continue
                 if k in self._levels:
                     z = self._levels[k][0]
@@ -2261,7 +2353,7 @@ def _make_dialog_class():
                     z = last + h
                     kind = "suggested"
                     tip = (f"Suggested: previous storey + Floor height "
-                           f"({h:.2f} m). Please check.")
+                           f"({_len_txt(h)}). Please check.")
                 self.table.cellWidget(r, COL_ELEV).setValue(z)
                 self._set_mark(r, COL_ELEV, kind, tip)
                 last = z
@@ -2271,7 +2363,87 @@ def _make_dialog_class():
 
         @staticmethod
         def _fmt_level(v):
-            return "±0.00" if abs(v) < 0.005 else f"{v:+.2f}"
+            """A storey level with its unit (the document's units)."""
+            if _pesi3d_units():
+                return ("±" + _len_txt(0.0)) if abs(v) < 0.0005 \
+                    else _len_txt(v, signed=True)
+            return ("±0.00" if abs(v) < 0.005 else f"{v:+.2f}") + " m"
+
+        def _imp_scale(self, n):
+            """« (1/4" = 1'-0")» on an imperial set, else nothing."""
+            if self._plan_unit != "imperial":
+                return ""
+            return _imperial_label(n)
+
+        def _level_unit(self):
+            """The unit the levels on the plans are written in: the one
+            picked, or with «Automatic» the plans' own (feet for an
+            imperial set, else metres)."""
+            code = (self.cb_lunit.currentData() if hasattr(self, "cb_lunit")
+                    else self.p.get("level_unit", "auto"))
+            if code in (None, "auto"):
+                return "ft" if self._plan_unit == "imperial" else "m"
+            return code
+
+        def _docunit_target(self):
+            """The document units the plans call for — or None when the
+            document already works in the plans' system."""
+            U = _pesi3d_units()
+            if not U or self._plan_unit not in ("metric", "imperial"):
+                return None
+            try:
+                from core import units as cu
+                scene = self.viewport.scene
+                cur = cu.model_units_of(scene)
+            except Exception:                              # noqa: BLE001
+                return None
+            imperial = cur.get("length") in ("in", "ft", "ft-in", "in-frac",
+                                             "ft-in-frac", "us-ft")
+            if self._plan_unit == "imperial" and not imperial:
+                return cu.with_profile(cur, "imperial")
+            if self._plan_unit == "metric" and imperial:
+                return cu.with_profile(cur, "metric")
+            return None
+
+        def _update_docunit(self):
+            if not hasattr(self, "cb_docunit"):
+                return
+            target = self._docunit_target()
+            if target is None:
+                self.cb_docunit.setVisible(False)
+                return
+            self.cb_docunit.setText(
+                "Plans in feet and inches — work on in ft-in"
+                if self._plan_unit == "imperial" else
+                "Metric plans — work on in metres")
+            self.cb_docunit.setVisible(True)
+
+        def _apply_docunit(self):
+            """After the import: the document takes the plans' unit."""
+            if not (hasattr(self, "cb_docunit") and self.cb_docunit.isVisible()
+                    and self.cb_docunit.isChecked()):
+                return
+            target = self._docunit_target()
+            if target is None:
+                return
+            try:
+                from core import units as cu
+                scene = self.viewport.scene
+                cu.apply_units(scene, target)
+                scene.version += 1
+                notify = getattr(self.viewport, "notify_scene_changed", None)
+                if callable(notify):
+                    notify()
+                else:
+                    self.viewport.update()
+            except Exception:                              # noqa: BLE001
+                pass
+
+        def _lunit_changed(self, *_a):
+            if self._busy:
+                return
+            self._read_levels()
+            self._changed()
 
         def _stories_text(self):
             if not self._stories:
@@ -2290,12 +2462,23 @@ def _make_dialog_class():
                     names, self._texts)
             except Exception:                              # noqa: BLE001
                 levels, typical, stories = {}, None, []
+            try:
+                self._plan_unit = pv.plan_unit(self._texts)
+            except Exception:                              # noqa: BLE001
+                self._plan_unit = None
+            self._update_docunit()
+            f = dict((c, k) for c, _l, k in LEVEL_UNITS).get(
+                self._level_unit(), 1.0)
+            if f != 1.0:                   # written in cm / mm / ft …
+                levels = {k: (v * f, src) for k, (v, src) in levels.items()}
+                stories = [(lb, v * f) for lb, v in stories]
+                typical = None if typical is None else typical * f
             self._levels, self._stories = levels, stories
             for r in range(self.table.rowCount()):
                 it = self.table.item(r, COL_LEVEL)
                 if self._pg(r) in levels:
                     v, src = levels[self._pg(r)]
-                    it.setText(f"{self._fmt_level(v)} m")
+                    it.setText(self._fmt_level(v))
                     it.setToolTip(f"Read from the sheets: {src}.")
                 else:
                     it.setText("—")
@@ -2305,7 +2488,7 @@ def _make_dialog_class():
                 self.sp_floor.setValue(typical)
                 self._busy = False
                 self.sp_floor.setToolTip(
-                    f"Default storey height for Stacked — {typical:.2f} m "
+                    f"Default storey height for Stacked — {_len_txt(typical)} "
                     "read from the storey markers on the sheets.")
             self._mark_missing()
             if self.rb_stack.isChecked() and (self._auto_elev or all(
@@ -3017,6 +3200,7 @@ def _make_dialog_class():
                     return
                 prog.close()
             self._attach_styles(cmd.groups)
+            self._apply_docunit()
             try:
                 info = cmd.info
                 self.viewport.flash_status(
@@ -3084,6 +3268,163 @@ def show_dialog(viewport, parent=None):
 # ---------------------------------------------------------------------------
 # Toolbar (PESI3D): icons drawn in IngeTrazo's own icon style
 # ---------------------------------------------------------------------------
+
+
+
+# ---------------------------------------------------------------------------
+# PESI3D unit fields — keep this block identical in every PESI3D plugin.
+# Every length, angle and number field shows and reads the units of the
+# open document (IngeTrazo ▸ Preferences ▸ Units: length unit and form,
+# precision, angle unit, decimal separator). value() stays in metres /
+# degrees, so the code behind a dialog never converts anything.
+# ---------------------------------------------------------------------------
+_PESI3D_UNITS = {}
+
+
+def _pesi3d_units():
+    """``{"Length", "Angle", "Area", "Number", "len", "area", "angle",
+    "num"}`` —
+    field classes and formatters in the document's units, or ``None`` on
+    IngeTrazo builds before 0.5.8 (then the plain fields are used)."""
+    if "ok" in _PESI3D_UNITS:
+        return _PESI3D_UNITS["ok"]
+    try:
+        import math as _m
+        from core import units
+        from views.length_field import LengthSpinBox
+        from PySide6.QtGui import QValidator
+        from PySide6.QtWidgets import QDoubleSpinBox
+    except Exception:  # noqa: BLE001 - an older IngeTrazo
+        _PESI3D_UNITS["ok"] = None
+        return None
+
+    def _read_number(text, suffix):
+        t = text.strip()
+        if suffix and t.endswith(suffix.strip()):
+            t = t[: -len(suffix.strip())]
+        t = t.replace(" ", "").replace(",", ".")
+        try:
+            return float(t)
+        except ValueError:
+            return None
+
+    class _Field(QDoubleSpinBox):
+        def _read(self, text):                     # → value or None
+            raise NotImplementedError
+
+        def valueFromText(self, text):
+            v = self._read(text)
+            return self.value() if v is None else v
+
+        def validate(self, text, pos):
+            v = self._read(text)
+            ok = v is not None and \
+                self.minimum() - 1e-9 <= v <= self.maximum() + 1e-9
+            return (QValidator.Acceptable if ok else QValidator.Intermediate,
+                    text, pos)
+
+        def fixup(self, text):
+            return text
+
+    class AngleSpinBox(_Field):
+        """value() in degrees; text in the document's angle unit (°, rad,
+        gon) and angle precision (at least ``decimals``)."""
+
+        def __init__(self, parent=None, minimum=-360.0, maximum=360.0,
+                     decimals=1):
+            super().__init__(parent)
+            self._unit = units.unit_setting("angle") or "deg"
+            self._shown = max(int(decimals),
+                              int(units.unit_setting("angle_precision") or 1))
+            super().setDecimals(9)
+            self.setRange(minimum, maximum)
+            self.setSingleStep({"deg": 1.0, "grad": 0.9}.get(
+                self._unit, _m.degrees(0.01)))
+            self.setKeyboardTracking(False)
+
+        def textFromValue(self, value):
+            return units.localized(units.format_angle(
+                _m.radians(value), self._unit, self._shown))
+
+        def _read(self, text):
+            r = units.parse(text, "angle", self._unit)
+            return _m.degrees(r.value) if r.ok else None
+
+    class AreaSpinBox(_Field):
+        """value() in m²; text in the document's area unit and precision."""
+
+        def __init__(self, parent=None, minimum=0.0, maximum=1e6):
+            super().__init__(parent)
+            u = units.unit_setting("area") or "auto"
+            self._unit = (units.area_unit_for(units.model_unit())
+                          if u == "auto" else u)
+            self._shown = max(2, int(units.unit_setting("area_precision")
+                                     or 2))
+            super().setDecimals(9)
+            self.setRange(minimum, maximum)
+            self.setSingleStep(units.convert(
+                10 ** -self._shown, self._unit, "m2"))
+            self.setKeyboardTracking(False)
+
+        def textFromValue(self, value):
+            return units.localized(units.format_area(
+                value, self._unit, self._shown))
+
+        def _read(self, text):
+            r = units.parse(text, "area", self._unit)
+            return r.value if r.ok else None
+
+    class NumberSpinBox(_Field):
+        """A plain number (%, passes, factor …) with the document's decimal
+        separator; «1,5» and «1.5» are both read."""
+
+        def __init__(self, parent=None, minimum=0.0, maximum=1e6,
+                     decimals=2, suffix=""):
+            super().__init__(parent)
+            self._dec, self._suf = int(decimals), suffix
+            super().setDecimals(max(int(decimals), 6))
+            self.setRange(minimum, maximum)
+            self.setSingleStep(1.0 if decimals == 0 else 10 ** -min(decimals, 1))
+            self.setKeyboardTracking(False)
+
+        def textFromValue(self, value):
+            return units.localized(f"{value:.{self._dec}f}{self._suf}")
+
+        def _read(self, text):
+            pre = self.prefix()
+            if pre and text.startswith(pre):
+                text = text[len(pre):]
+            return _read_number(text, self._suf)
+
+    class Length(LengthSpinBox):
+        def __init__(self, parent=None, minimum=0.0, maximum=1000.0,
+                     decimals=None):
+            super().__init__(parent, minimum=minimum, maximum=maximum,
+                             decimals=decimals)
+            self.setKeyboardTracking(False)
+
+    def fmt_len(metres, fine=False):
+        if fine:
+            return units.fmt_len_fine(float(metres))
+        return units.fmt_len(float(metres))
+
+    def fmt_area(m2):
+        return units.fmt_area(float(m2))
+
+    def fmt_angle(deg):
+        return units.fmt_angle_deg(float(deg))
+
+    def fmt_num(v, dec=2):
+        return units.localized(f"{float(v):,.{dec}f}".replace(",", " ")
+                               if abs(v) >= 1e4 else f"{float(v):.{dec}f}")
+
+    res = {"Length": Length, "Angle": AngleSpinBox, "Number": NumberSpinBox,
+           "Area": AreaSpinBox,
+           "len": fmt_len, "area": fmt_area, "angle": fmt_angle,
+           "num": fmt_num, "units": units}
+    _PESI3D_UNITS["ok"] = res
+    return res
+
 
 def _pesi3d_icons():
     """Icon key → draw(painter, ink, accent) on a 48 px canvas."""
