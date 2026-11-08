@@ -14,12 +14,64 @@ from __future__ import annotations
 LONG_SIDE = 4096      # px of the rendered sheet's long side (zoom limit)
 
 
+def _painter_path(paths_runs, s, h, winding=True):
+    """ONE QPainterPath of the runs of several paths — each path starts
+    anew, a run goes on from the last when it starts where that ended —
+    sheet points to image pixels. Read in one call from a buffer in
+    QPainterPath's QDataStream form (count; type, x, y per element; start
+    of the last subpath; fill rule): building it point by point cost one
+    Python→Qt call per point."""
+    import struct
+
+    import numpy as np
+    from PySide6.QtCore import QByteArray, QDataStream, Qt
+    from PySide6.QtGui import QPainterPath
+
+    kinds, pts_all = [], []
+    move = kinds.append
+    for runs in paths_runs:
+        last = None
+        for pts, _c in runs:
+            x0, y0 = pts[0]
+            if last is None or abs(last[0] - x0) > 1e-6 \
+                    or abs(last[1] - y0) > 1e-6:
+                move(0)                                 # MoveToElement
+                pts_all.append(pts[0])
+            kinds += [1] * (len(pts) - 1)               # LineToElement
+            pts_all += pts[1:]
+            last = pts[-1]
+    path = QPainterPath()
+    n = len(kinds)
+    if n < 256:                       # a few points: the buffer costs more
+        for k, (x, y) in zip(kinds, pts_all):
+            if k:
+                path.lineTo(x * s, (h - y) * s)
+            else:
+                path.moveTo(x * s, (h - y) * s)
+        path.setFillRule(Qt.FillRule.WindingFill if winding
+                         else Qt.FillRule.OddEvenFill)
+        return path
+    rec = np.empty(n, dtype=[("t", ">i4"), ("x", ">f8"), ("y", ">f8")])
+    a = np.asarray(pts_all, dtype=np.float64)
+    rec["t"] = kinds
+    rec["x"] = a[:, 0] * s
+    rec["y"] = (h - a[:, 1]) * s
+    starts = np.flatnonzero(rec["t"] == 0)
+    buf = (struct.pack(">i", n) + rec.tobytes()
+           + struct.pack(">ii", int(starts[-1]), 1 if winding else 0))
+    QDataStream(QByteArray(buf)) >> path
+    return path
+
+
 def render_page(vec, texts, long_side: int = LONG_SIDE):
     """``QImage`` of the sheet: white paper, filled shapes, lines, texts.
-    ``vec`` = PageVectors, ``texts`` = [PageText] (may be empty)."""
+    ``vec`` = PageVectors, ``texts`` = [PageText] (may be empty).
+
+    Paths are drawn in the order of the PDF, so what covers what stays;
+    stroked paths following each other with the same pen go as ONE painter
+    path (an A0 sheet from Revit: 1 900 strokes instead of 554 000)."""
     from PySide6.QtCore import QPointF, Qt
-    from PySide6.QtGui import (QBrush, QColor, QFont, QImage, QPainter,
-                               QPainterPath, QPen)
+    from PySide6.QtGui import QBrush, QColor, QFont, QImage, QPainter, QPen
 
     w, h = max(vec.width, 1.0), max(vec.height, 1.0)
     s = long_side / max(w, h)
@@ -33,30 +85,30 @@ def render_page(vec, texts, long_side: int = LONG_SIDE):
         r, g, b = (max(0, min(255, int(round(c * 255)))) for c in rgb)
         return QColor(r, g, b)
 
-    def qpath(runs):
-        path = QPainterPath()
-        last = None
-        for pts, _c in runs:
-            x0, y0 = pts[0]
-            if last is None or abs(last[0] - x0) > 1e-6 \
-                    or abs(last[1] - y0) > 1e-6:
-                path.moveTo(x0 * s, (h - y0) * s)
-            for x, y in pts[1:]:
-                path.lineTo(x * s, (h - y) * s)
-            last = pts[-1]
-        return path
+    batch = []          # runs of the strokes waiting, one list per path
+    batch_pen = None    # (rgb, width) they share
+
+    def flush():
+        if batch:
+            rgb, width = batch_pen
+            pen = QPen(col(rgb), max(width * s, 0.6))
+            pen.setCapStyle(Qt.PenCapStyle.FlatCap)
+            p.strokePath(_painter_path(batch, s, h), pen)
+            batch.clear()
 
     no_pen = QPen(Qt.PenStyle.NoPen)
     for pp in vec.paths:
-        path = qpath(pp.runs)
         if pp.fill:
-            path.setFillRule(Qt.FillRule.OddEvenFill if pp.evenodd
-                             else Qt.FillRule.WindingFill)
-            p.fillPath(path, QBrush(col(pp.fill_rgb)))
+            flush()
+            p.fillPath(_painter_path([pp.runs], s, h, not pp.evenodd),
+                       QBrush(col(pp.fill_rgb)))
         if pp.stroke:
-            pen = QPen(col(pp.stroke_rgb), max(pp.width * s, 0.6))
-            pen.setCapStyle(Qt.PenCapStyle.FlatCap)
-            p.strokePath(path, pen)
+            pen = (pp.stroke_rgb, pp.width)
+            if pen != batch_pen:
+                flush()
+                batch_pen = pen
+            batch.append(pp.runs)
+    flush()
     p.setPen(no_pen)
 
     font = QFont("Arial")

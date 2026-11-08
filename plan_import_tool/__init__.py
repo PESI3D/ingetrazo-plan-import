@@ -160,12 +160,14 @@ def _is_white(rgb) -> bool:
     return all(c >= WHITE for c in rgb)
 
 
-def collect_runs(vectors, p: dict):
+def collect_runs(vectors, p: dict, filtered=None):
     """The runs to import, by the content and filter options. Returns
-    ``(runs, stats)``; runs are ``(points_pt, curved)``."""
+    ``(runs, stats)``; runs are ``(points_pt, curved)``. ``filtered``:
+    ``filter_paths(vectors.paths, p)`` when at hand already."""
     from .cleanup import filter_paths
     runs = []
-    paths, fcount = filter_paths(vectors.paths, p)
+    paths, fcount = filtered if filtered is not None \
+        else filter_paths(vectors.paths, p)
     stats = {"paths": 0, "white": 0, "fills": 0, "strokes": 0, **fcount}
     for path in paths:
         use = False
@@ -202,16 +204,17 @@ def style_key(path) -> tuple:
     return width, srgb, frgb
 
 
-def style_record(vectors, p: dict, crop=None) -> dict:
+def style_record(vectors, p: dict, crop=None, filtered=None) -> dict:
     """The sheet's drawing kept BY LINE STYLE, for plugins that tell
     building parts apart by how they are drawn (Walls: the cut walls are
     the filled shapes or the heavy pen). ``{"grid", "styles": [{"w",
     "stroke", "fill", "len", "area"}], "runs": {sid: [[x, y, x, y, …]]},
     "fills": [{"s": sid, "eo": evenodd, "rings": [[x, y, …]]}]}`` in sheet
     points × ``STYLE_GRID``, cut to ``crop``. Same paths as the import
-    (filters and «Skip white» applied)."""
+    (filters and «Skip white» applied); ``filtered`` as in collect_runs."""
     from .cleanup import filter_paths
-    paths, _counts = filter_paths(vectors.paths, p)
+    paths, _counts = filtered if filtered is not None \
+        else filter_paths(vectors.paths, p)
     g = STYLE_GRID
     styles, index = [], {}
     runs_by, fills = {}, []
@@ -297,40 +300,63 @@ def metres_per_point(scale_n: float) -> float:
 FLAT = ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0))     # sheet x, y → world
 
 
+def edge_arrays(runs):
+    """``(xy, ia, ib, curved)`` for build_group: the points of the runs
+    (n × 2), every edge as two indices into them, and per curved run the
+    range of its edges. No IngeTrazo objects — a worker thread can make
+    them."""
+    import numpy as np
+    xy, starts, curved = [], [], []
+    e = 0
+    for run, c in runs:
+        n = len(run)
+        if n < 2:
+            continue
+        starts.append(len(xy))
+        xy.extend(run)
+        if c and n > 2:
+            curved.append((e, e + n - 1))
+        e += n - 1
+    xy = np.asarray(xy, dtype=np.float64).reshape(-1, 2)
+    if not starts:
+        empty = np.zeros(0, dtype=np.int64)
+        return xy, empty, empty, curved
+    last = np.append(np.asarray(starts[1:], dtype=np.int64), len(xy)) - 1
+    keep = np.ones(len(xy), dtype=bool)
+    keep[last] = False                  # a run's last point starts no edge
+    ia = np.flatnonzero(keep)
+    return xy, ia, ia + 1, curved
+
+
 def build_group(runs, mpp: float, name: str, offset=(0.0, 0.0, 0.0),
-                axes=FLAT):
+                axes=FLAT, arrays=None):
     """The runs as ONE classic Group of edges (metres): a sheet point
     (x, y) lands at ``offset + x·mpp·U + y·mpp·V`` with ``axes = (U, V)``
     — flat on the ground by default, upright for elevations/sections.
     Identical edges are merged by the welding; curved runs get one curve
-    id each."""
+    id each. ``arrays``: ``edge_arrays(runs)`` when made already."""
     import numpy as np
     from PySide6.QtGui import QMatrix4x4
     from core.group import Group
     from core.mesh import Mesh
 
+    xy, ia, ib, curved = edge_arrays(runs) if arrays is None else arrays
+    if not len(xy):
+        raise ValueError("Nothing to import with these options.")
+    plain = (False, None, None)
+    flags = [plain] * len(ia)
+    for e0, e1 in curved:
+        flags[e0:e1] = [(False, Mesh.next_curve_id(), None)] * (e1 - e0)
     o = np.asarray(offset, dtype=np.float64)
     u = np.asarray(axes[0], dtype=np.float64) * mpp
     v = np.asarray(axes[1], dtype=np.float64) * mpp
-    mesh = Mesh()
-    xy, ia, ib, flags = [], [], [], []
-    for run, curved in runs:
-        if len(run) < 2:
-            continue
-        cid = Mesh.next_curve_id() if curved and len(run) > 2 else None
-        base = len(xy)
-        xy.extend(run)
-        for k in range(len(run) - 1):
-            ia.append(base + k)
-            ib.append(base + k + 1)
-            flags.append((False, cid, None))
-    if not xy:
-        raise ValueError("Nothing to import with these options.")
-    a = np.asarray(xy, dtype=np.float64)
-    pts = o + np.outer(a[:, 0], u) + np.outer(a[:, 1], v)
-    vobjs, ids = mesh.bulk_weld(pts)
-    ids = np.asarray(ids)
-    mesh.add_edges_welded(vobjs, ids[ia], ids[ib], flags=flags)
+    with _pv().gc_paused():      # a Vertex and an Edge object per point/line
+        mesh = Mesh()
+        a = np.asarray(xy, dtype=np.float64)
+        pts = o + np.outer(a[:, 0], u) + np.outer(a[:, 1], v)
+        vobjs, ids = mesh.bulk_weld(pts)
+        ids = np.asarray(ids)
+        mesh.add_edges_welded(vobjs, ids[ia], ids[ib], flags=flags)
     if not mesh.edges:
         raise ValueError("Nothing to import with these options.")
     group = Group(mesh, name=name)
@@ -515,10 +541,39 @@ def layer_name(path, page_no: int, name: str | None) -> str:
 
 
 def layer_commands(groups, names):
-    """One AssignLayerCommand per group: creates the layer when missing
-    (and removes it again on undo), puts the group on it."""
-    from core.history import AssignLayerCommand
-    return [AssignLayerCommand([g], n) for g, n in zip(groups, names) if n]
+    """Every group labelled with its layer before it goes in (no name: no
+    layer), as IngeTrazo's own importers do it, and one command creating
+    the layers still missing — removed again on undo. (1.2.1 used an
+    AssignLayerCommand per group; each made IngeTrazo check every group of
+    the document afresh, twice on every Live Preview update.)"""
+    from core.history import Command
+    from core.layers import DEFAULT_LAYER, assign_layer
+
+    class _MakeLayers(Command):
+        def __init__(self, names):
+            self.names = names
+            self._created = []
+
+        def do(self, scene):
+            from core.layers import Layer
+            self._created = []
+            for n in self.names:
+                if scene.layer(n) is None:
+                    scene.layers.append(Layer(n))
+                    self._created.append(n)
+            scene.version += 1
+
+        def undo(self, scene):
+            for n in self._created:
+                ly = scene.layer(n)
+                if ly is not None:
+                    scene.layers.remove(ly)
+            scene.version += 1
+
+    for g, n in zip(groups, names):
+        assign_layer(g, n or DEFAULT_LAYER)
+    wanted = list(dict.fromkeys(n for n in names if n))
+    return [_MakeLayers(wanted)] if wanted else []
 
 
 def insert_groups(viewport, groups, select=True, extra=()):
@@ -560,6 +615,7 @@ def insert_groups(viewport, groups, select=True, extra=()):
 def _make_dialog_class():
     import threading
     import time
+    import types
 
     from PySide6.QtCore import QEventLoop, QObject, Qt, QTimer, Signal
     from PySide6.QtWidgets import (
@@ -626,7 +682,23 @@ def _make_dialog_class():
             self._stories = []           # [(label, level_m)]
             self._scan_id = 0
             self._busy = False           # filling widgets: no _changed
-            self._computing = False
+            self._computing = False      # building groups (main thread)
+            self._closing = False
+            self._accepting = False      # OK waiting for the background
+            # background reading: pages wanted first, pages it could not read
+            self._cond = threading.Condition()
+            self._want = []
+            self._vec_err = {}
+            self._reader = None          # the reading thread
+            # background build: the latest job (see _submit) and its thread
+            self._job = None
+            self._job_gen = 0
+            self._builder = None
+            self._prev_opts = self._prev_p = None
+            self._filtered_cache = {}    # (file, page, filters) -> filter_paths
+            self._style_cache = {}       # (file, page, crop, opts) -> record
+            self._group_rows = {}        # id(group) -> (row, offset, axes)
+            self._snaps = {}             # page -> snap points (measuring)
             self._preview_cmd = None
             self._timer = QTimer(self)
             self._timer.setSingleShot(True)
@@ -1014,9 +1086,12 @@ def _make_dialog_class():
                 return
             self._timer.stop()
             self._undo_preview()
+            self._job_gen += 1                  # builds of the last file: off
             self._pages = pages
             self._titles = {}
             self._vec = {}
+            self._vec_err = {}
+            self._want = []
             self._built = {}
             self._texts = {}
             self._images = {}
@@ -1026,6 +1101,12 @@ def _make_dialog_class():
             self._auto_elev = True
             self._mark = {}
             self._runs_cache = {}
+            self._run_stats = {}
+            self._filtered_cache = {}
+            self._style_cache = {}
+            self._group_rows = {}
+            self._snaps = {}
+            self._prev_opts = self._prev_p = None
             self._rowpage = list(range(len(pages)))
             self._crop = {}
             self._ref = {}
@@ -1160,19 +1241,36 @@ def _make_dialog_class():
 
         def _start_worker(self, f):
             """Off the main thread: read «Name 1:100» from every sheet, then
-            the geometry of every page — so the preview later only builds."""
+            the geometry of every page — the pages asked for first (the one
+            shown, those a build waits for) — so nothing waits on the main
+            thread for a page to be read."""
             self._scan_id += 1
             scan_id = self._scan_id
             n = len(self._pages)
-            vec = self._vec                  # this file's own cache
+            vec, err = self._vec, self._vec_err   # this file's own caches
+            cond, want = self._cond, self._want
             relay = self._relay
             self.lb_scan.setText(f"Reading titles… 0 / {n}")
+
+            def next_page():
+                with cond:
+                    while want:
+                        k = want.pop(0)
+                        if k not in vec and k not in err:
+                            return k
+                for k in range(n):
+                    if k not in vec and k not in err:
+                        return k
+                return None
 
             def work():
                 pv = _pv()
                 try:
                     reader = pv.open_reader(f)
-                except Exception:                          # noqa: BLE001
+                except Exception as exc:                   # noqa: BLE001
+                    with cond:
+                        err.update({k: exc for k in range(n)})
+                        cond.notify_all()
                     relay.msg.emit((scan_id, "end", None, None))
                     return
                 for i in range(n):
@@ -1184,18 +1282,80 @@ def _make_dialog_class():
                         name, scale, texts = None, None, []
                     relay.msg.emit((scan_id, "title", i,
                                     (name, scale, texts)))
-                for i in range(n):
-                    if scan_id != self._scan_id:
-                        return
-                    if i not in vec:
-                        try:
-                            vec[i] = pv.extract(f, i)
-                        except Exception:                  # noqa: BLE001
-                            pass
+                while scan_id == self._scan_id:
+                    i = next_page()
+                    if i is None:
+                        break
+                    try:
+                        v = pv.extract(f, i, reader=reader)
+                    except Exception as exc:               # noqa: BLE001
+                        with cond:
+                            err[i] = exc
+                            cond.notify_all()
+                    else:
+                        with cond:
+                            vec[i] = v
+                            cond.notify_all()
                     relay.msg.emit((scan_id, "geom", i, None))
                 relay.msg.emit((scan_id, "end", None, None))
 
-            threading.Thread(target=work, daemon=True).start()
+            self._reader = threading.Thread(target=work, daemon=True)
+            self._reader.start()
+
+        def _want_page(self, k):
+            """Read page ``k`` next (the background reading)."""
+            with self._cond:
+                if k in self._want:
+                    self._want.remove(k)
+                self._want.insert(0, k)
+
+        def _wait_vectors(self, k, alive):
+            """Page ``k``'s PageVectors, waited for — off the main thread
+            only. None when ``alive()`` turns false meanwhile."""
+            with self._cond:
+                if k not in self._vec and k not in self._vec_err \
+                        and k not in self._want:
+                    self._want.append(k)
+                while k not in self._vec and k not in self._vec_err:
+                    if not alive():
+                        return None
+                    self._cond.wait(0.25)
+                if k in self._vec_err:
+                    raise self._vec_err[k]
+                return self._vec[k]
+
+        def _wait_pages(self, pages, text):
+            """Wait — a progress dialog, the window alive — until the
+            background reading has read ``pages``. False when cancelled or
+            a page could not be read (its error is shown)."""
+            missing = [k for k in pages if k not in self._vec]
+            if not missing:
+                return True
+            for k in reversed(missing):
+                self._want_page(k)
+            prog = QProgressDialog(text, "Cancel", 0, len(missing), self)
+            prog.setWindowTitle(TITLE)
+            prog.setWindowModality(Qt.WindowModality.WindowModal)
+            prog.setMinimumDuration(300)
+            try:
+                while True:
+                    left = [k for k in missing if k not in self._vec
+                            and k not in self._vec_err]
+                    if not left:
+                        break
+                    if prog.wasCanceled() or self._reader is None \
+                            or not self._reader.is_alive():
+                        return False
+                    prog.setValue(len(missing) - len(left))
+                    QApplication.processEvents()
+                    time.sleep(0.03)
+            finally:
+                prog.close()
+            for k in pages:
+                if k in self._vec_err:
+                    self._error(f"Page {k + 1}: {self._vec_err[k]}")
+                    return False
+            return True
 
         def _on_worker(self, payload):
             scan_id, kind, i, data = payload
@@ -1230,8 +1390,14 @@ def _make_dialog_class():
                 if i == n - 1:
                     self._read_levels()
             elif kind == "geom":
-                self.lb_scan.setText(f"Reading geometry… {i + 1} / {n}"
+                done = sum(1 for k in range(n)
+                           if k in self._vec or k in self._vec_err)
+                self.lb_scan.setText(f"Reading geometry… {done} / {n}"
                                      + self._stories_text())
+                if i == self._shown and self._images.get(i) is None:
+                    self._render_page(i, keep_view=True)
+            elif kind in ("runs", "styles", "build_error", "progress"):
+                self._on_build(kind, i, data)
             else:
                 self.lb_scan.setText("Pages read." + self._stories_text())
 
@@ -1408,10 +1574,12 @@ def _make_dialog_class():
             base = {"strokes": self.p["strokes"], "fills": self.p["fills"]}
             table = {}
             pages = sorted({r["pg"] for r in self._rows() if r["use"]})
+            if not self._wait_pages(pages, "Reading the sheets…"):
+                return
             QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
             try:
                 for k in pages:
-                    for c, n in colour_table(self._vectors(k).paths,
+                    for c, n in colour_table(self._vec[k].paths,
                                              base).items():
                         table[c] = table.get(c, 0) + n
             finally:
@@ -1484,6 +1652,8 @@ def _make_dialog_class():
             if not pages:
                 self._error("Choose a page in the list first.")
                 return
+            if not self._wait_pages(pages, "Reading the sheets…"):
+                return
             self.view.cancel_rect()
             self.btn_crop.setChecked(False)
             self.btn_view.setChecked(False)
@@ -1504,7 +1674,7 @@ def _make_dialog_class():
                             f"Page {k + 1} ({n + 1} of {len(pages)})…")
                     QApplication.processEvents(
                         QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
-                    vec = self._vectors(k)
+                    vec = self._vec[k]
                     runs, _st = collect_runs(vec, {
                         "strokes": True, "fills": True, "skip_white": True})
                     rects = autocrop.suggest_crops(
@@ -1581,10 +1751,6 @@ def _make_dialog_class():
             self._shown = i
             img = self._images.get(i)
             if img is None:
-                if self._vec.get(i) is None:
-                    self.view.set_message(f"Reading page {i + 1}…")
-                    QTimer.singleShot(30, lambda: self._render_page(i))
-                    return
                 self._render_page(i, keep_view)
                 return
             self.view.set_image(img, self._caption(i), keep_view,
@@ -1596,6 +1762,9 @@ def _make_dialog_class():
                 return
             try:
                 vec = self._vectors(i)
+                if vec is None:                 # drawn once it is read
+                    self.view.set_message(f"Reading page {i + 1}…")
+                    return
                 img = render_page(vec, self._texts.get(i, []))
             except Exception as exc:                       # noqa: BLE001
                 self.view.set_message(f"Page {i + 1}: {exc}")
@@ -1623,7 +1792,7 @@ def _make_dialog_class():
                             "must be shown in the page view.")
                 return
             try:
-                snaps = page_points(self._vectors(i))
+                snaps = self._snap_points(i)
             except Exception:                              # noqa: BLE001
                 snaps = None
             ok = self.view.start_measure(
@@ -1655,7 +1824,7 @@ def _make_dialog_class():
                             "must be shown in the page view.")
                 return
             try:
-                snaps = page_points(self._vectors(self._shown))
+                snaps = self._snap_points(self._shown)
             except Exception:                              # noqa: BLE001
                 snaps = None
             ok = self.view.start_pick(
@@ -2192,26 +2361,282 @@ def _make_dialog_class():
 
         # ---- building ----------------------------------------------------
         def _vectors(self, i):
+            """Page ``i``'s PageVectors — or None while the background
+            reading has not got to it (it reads that page next)."""
             v = self._vec.get(i)
-            if v is None:                    # not read in the background yet
-                v = self._vec[i] = _pv().extract(self.ed_file.text(), i)
+            if v is None:
+                err = self._vec_err.get(i)
+                if err is not None:
+                    raise err
+                self._want_page(i)
             return v
 
-        def _runs(self, row, opts):
-            """Runs + bbox (sheet points) of a table row — its page, cut
-            to its crop frame — kept per options."""
-            cache = self.__dict__.setdefault("_runs_cache", {})
+        def _snap_points(self, i):
+            """Line ends of page ``i`` to snap to (kept per page)."""
+            pts = self._snaps.get(i)
+            if pts is None:
+                vec = self._vectors(i)
+                if vec is None:
+                    return None
+                pts = self._snaps[i] = page_points(vec)
+            return pts
+
+        @staticmethod
+        def _filter_key(path, k, p):
+            return (path, k, bool(p.get("strokes")), bool(p.get("fills")),
+                    p.get("min_part_mm"), p.get("min_width_mm"),
+                    bool(p.get("skip_hatch")),
+                    tuple(sorted(p.get("skip_colours") or ())))
+
+        def _filtered(self, path, k, vec, p):
+            """``filter_paths`` of page ``k`` — kept, the import and the
+            style record both need it."""
+            from .cleanup import filter_paths
+            key = self._filter_key(path, k, p)
+            out = self._filtered_cache.get(key)
+            if out is None:
+                out = self._filtered_cache[key] = filter_paths(vec.paths, p)
+            return out
+
+        def _runs(self, row, opts, job=None):
+            """``(runs, bbox, edge arrays)`` of a table row (sheet points) —
+            its page, cut to its crop frame — kept per options. Made by the
+            background build (``job``); on the main thread taken from what
+            it made."""
             k, crop = row["pg"], row["crop"]
-            key = (self.ed_file.text(), k, crop, opts, row["scale"])
-            if key not in cache:
-                runs, st = collect_runs(self._vectors(k), self.p)
+            path = job.path if job is not None else self.ed_file.text()
+            key = (path, k, crop, opts, row["scale"])
+            out = self._runs_cache.get(key)
+            if out is not None:
+                return out
+            if job is None:
+                vec, p = self._vectors(k), self.p
+                if vec is None:
+                    raise ValueError(f"Page {k + 1} is still being read.")
+            else:
+                vec = self._wait_vectors(k, lambda: job.gen == self._job_gen)
+                if vec is None:
+                    return None                       # superseded
+                p = job.p
+            with _pv().gc_paused():
+                runs, st = collect_runs(vec, p,
+                                        self._filtered(path, k, vec, p))
                 runs = clip_runs(runs, crop)
-                runs, st2 = clean_runs(runs, self.p,
+                runs, st2 = clean_runs(runs, p,
                                        metres_per_point(row["scale"]))
                 st.update(st2)
-                self.__dict__.setdefault("_run_stats", {})[key] = st
-                cache[key] = (runs, runs_bbox(runs))
-            return cache[key]
+                out = (runs, runs_bbox(runs),
+                       edge_arrays(runs) if runs else None)
+            self._run_stats[key] = st
+            self._runs_cache[key] = out
+            return out
+
+        def _submit(self, final=False):
+            """Hand the current settings to the background build, which
+            makes the runs (filters, clean up) of every ticked sheet and
+            then their style records; a newer job replaces an older one.
+            Returns the job."""
+            self._read_ui()
+            job = types.SimpleNamespace(
+                gen=self._job_gen + 1, path=self.p["file"],
+                rows=self._rows(), p=dict(self.p),
+                opts=content_opts(self.p), key=self._state_key(),
+                final=final, runs_done=False, styles_done=False,
+                error=None)
+            with self._cond:
+                self._job_gen = job.gen
+                self._job = job
+                self._cond.notify_all()
+            if self._builder is None or not self._builder.is_alive():
+                self._builder = threading.Thread(
+                    target=self._build_loop, args=(self._scan_id,),
+                    daemon=True)
+                self._builder.start()
+            return job
+
+        def _build_loop(self, scan_id):
+            """The background build: one job after the other (only the
+            newest counts); results go to the main thread as messages."""
+            relay = self._relay
+            last = None
+
+            def live():
+                return scan_id == self._scan_id and not self._closing
+
+            while live():
+                with self._cond:
+                    while live() and (self._job is None or self._job is last):
+                        self._cond.wait(0.5)
+                    job = self._job
+                if not live():
+                    break
+                last = job
+                try:
+                    if not self._job_runs(job, relay, scan_id):
+                        continue                          # superseded
+                    job.runs_done = True
+                    relay.msg.emit((scan_id, "runs", job.gen, None))
+                    if self._job_styles(job):
+                        job.styles_done = True
+                        relay.msg.emit((scan_id, "styles", job.gen, None))
+                except Exception as exc:                   # noqa: BLE001
+                    job.error = str(exc) or type(exc).__name__
+                    relay.msg.emit((scan_id, "build_error", job.gen,
+                                    job.error))
+
+        def _job_runs(self, job, relay, scan_id):
+            """The runs of every ticked row of ``job``; False when a newer
+            job came meanwhile."""
+            self._evict(job)
+            rows = [r for r in job.rows if r["use"]]
+            for n, r in enumerate(rows):
+                if job.gen != self._job_gen:
+                    return False
+                relay.msg.emit((scan_id, "progress", job.gen,
+                                f"page {r['page']} ({n + 1} of {len(rows)})"))
+                if self._runs(r, job.opts, job) is None:
+                    return False
+            return job.gen == self._job_gen
+
+        def _evict(self, job):
+            """Keep what the options of this job and of the last one made,
+            nothing older: a big sheet's runs take some 100 MB."""
+            prev = self._prev_opts
+            if prev is not None and prev != job.opts:
+                keep = {prev, job.opts}
+                for cache in (self._runs_cache, self._run_stats,
+                              self._style_cache):
+                    for key in [k for k in list(cache) if k[3] not in keep]:
+                        cache.pop(key, None)
+                fkeys = {self._filter_key(job.path, r["pg"], p)
+                         for r in job.rows
+                         for p in (job.p, self._prev_p or job.p)}
+                for key in [k for k in list(self._filtered_cache)
+                            if k not in fkeys]:
+                    self._filtered_cache.pop(key, None)
+            self._prev_opts, self._prev_p = job.opts, job.p
+
+        def _job_styles(self, job):
+            """The style records of every ticked row of ``job`` (for plugins
+            like Walls); False when a newer job came meanwhile."""
+            for r in job.rows:
+                if not r["use"]:
+                    continue
+                if job.gen != self._job_gen:
+                    return False
+                key = (job.path, r["pg"], r["crop"], job.opts)
+                if key in self._style_cache:
+                    continue
+                vec = self._wait_vectors(r["pg"],
+                                         lambda: job.gen == self._job_gen)
+                if vec is None:
+                    return False
+                with _pv().gc_paused():
+                    rec = style_record(vec, job.p, r["crop"], self._filtered(
+                        job.path, r["pg"], vec, job.p))
+                self._style_cache[key] = rec
+            return True
+
+        def _attach_styles(self, groups):
+            """How every line was drawn, for plugins like Walls (the edges
+            themselves keep no style): each group's style record."""
+            opts = content_opts(self.p)
+            path = self.ed_file.text()
+            for g in groups:
+                info = self._group_rows.get(id(g))
+                if info is None:
+                    continue
+                r, off, axes = info
+                try:
+                    base = self._style_cache.get(
+                        (path, r["pg"], r["crop"], opts))
+                    if base is None:
+                        vec = self._vectors(r["pg"])
+                        base = style_record(vec, self.p, r["crop"],
+                                            self._filtered(path, r["pg"],
+                                                           vec, self.p))
+                    rec = dict(base)            # each group its own record
+                    rec["styles"] = [dict(st) for st in base["styles"]]
+                    rec.update({"version": VERSION, "page": r["page"],
+                                "scale": r["scale"],
+                                "mpp": metres_per_point(r["scale"]),
+                                "offset": list(off),
+                                "axes": [list(a) for a in axes]})
+                    g.ext = {KEY: rec}
+                except Exception:                          # noqa: BLE001
+                    pass                 # the import works without it
+
+        def _wait(self, done, text):
+            """Wait — a progress dialog, the window alive — until ``done()``.
+            False when cancelled."""
+            if done():
+                return True
+            prog = QProgressDialog(text, "Cancel", 0, 0, self)
+            prog.setWindowTitle(TITLE)
+            prog.setWindowModality(Qt.WindowModality.WindowModal)
+            prog.setMinimumDuration(300)
+            try:
+                while not done():
+                    if prog.wasCanceled():
+                        return False
+                    QApplication.processEvents()
+                    time.sleep(0.03)
+            finally:
+                prog.close()
+            return True
+
+        def _on_build(self, kind, gen, data):
+            """A message of the background build (main thread)."""
+            job = self._job
+            if job is None or gen != job.gen:
+                return                                     # an older job
+            if kind == "progress":
+                if self.preview.isChecked() and not job.final:
+                    self._banner("busy", f"⟳ Preparing the preview… {data}")
+            elif kind == "build_error":
+                if self.preview.isChecked():
+                    self._banner("error", f"Preview failed: {data}")
+            elif kind == "runs" and not job.final:
+                self._show_job(job)
+
+        def _show_job(self, job, steps=None):
+            """The runs of ``job`` are made: build its groups (IngeTrazo
+            objects — main thread), one sheet per turn of the event loop so
+            the window stays alive, then put them in place of the
+            preview."""
+            if job is not self._job or not self.preview.isChecked():
+                return
+            if self._computing:            # a build on the main thread now
+                QTimer.singleShot(100, lambda: self._show_job(job, steps))
+                return
+            if self._state_key() != job.key:
+                return                     # changed meanwhile: newer job due
+            if steps is None and \
+                    getattr(self.viewport.scene, "edit_group", None) is None:
+                steps = self._missing_groups(job.opts)
+            if steps:
+                r, off, axes = steps[0]
+                self._banner("busy", f"⟳ Building the preview… sheet "
+                             f"{r['page']} ({len(steps)} to go)")
+                self._computing = True
+                try:
+                    self._group_for(r, job.opts, off, axes)
+                except Exception as exc:                   # noqa: BLE001
+                    self._banner("error", f"Preview failed: {exc}")
+                    return
+                finally:
+                    self._computing = False
+                QTimer.singleShot(0, lambda: self._show_job(job, steps[1:]))
+                return
+            self._undo_preview()
+            try:
+                self._preview_cmd = self._run(self._preview_progress, False)
+                self._banner("live", "● <b>LIVE PREVIEW</b> — "
+                             + self._result_text(self._preview_cmd.info)
+                             + " · changes apply instantly")
+            except Exception as exc:                       # noqa: BLE001
+                self._preview_cmd = None
+                self._banner("error", f"Preview failed: {exc}")
 
         def _row_texts(self, row):
             texts = self._texts.get(row["pg"], [])
@@ -2248,7 +2673,7 @@ def _make_dialog_class():
                     dx, dy = -r["ref"][0] * mpp, -r["ref"][1] * mpp
                 out[k] = ((dx, dy, float(r["elev"])), FLAT)
                 if r["type"] == "Floor plan":
-                    _runs, bb = self._runs(r, opts)
+                    _runs, bb, _arr = self._runs(r, opts)
                     if bb is not None:
                         b = (bb[0] * mpp + dx, bb[1] * mpp + dy,
                              bb[2] * mpp + dx, bb[3] * mpp + dy)
@@ -2269,7 +2694,7 @@ def _make_dialog_class():
                 side = UPRIGHT.get(r["type"])
                 if side is None:
                     continue
-                _runs, bb = self._runs(r, opts)
+                _runs, bb, _arr = self._runs(r, opts)
                 if bb is None:
                     continue
                 mpp = metres_per_point(r["scale"])
@@ -2300,6 +2725,10 @@ def _make_dialog_class():
             # container's space (it changes the mesh): no reuse there.
             if getattr(self.viewport.scene, "edit_group", None) is not None:
                 self._built.clear()
+            # groups of older options: gone (a sheet's mesh is big)
+            keep = {opts, self._prev_opts}
+            for key in [k for k in self._built if k[3] not in keep]:
+                del self._built[key]
             groups, empty = [], []
             self._layer_names = []
             for n, (k, r) in enumerate(ticked):
@@ -2309,29 +2738,12 @@ def _make_dialog_class():
                     continue
                 off, axes = place[k]
                 off = tuple(round(c, 6) for c in off)
-                key = (r["pg"], r["crop"], r["scale"], opts, off, axes)
-                g = self._built.get(key)
+                g = self._group_for(r, opts, off, axes)
                 if g is None:
-                    runs, _bb = self._runs(r, opts)
-                    if not runs:
-                        empty.append(r["page"])
-                        continue
-                    g = build_group(runs, metres_per_point(r["scale"]),
-                                    "", off, axes)
-                    # How every line was drawn, for plugins like Walls
-                    # (the edges themselves keep no style).
-                    try:
-                        rec = style_record(self._vectors(r["pg"]), self.p,
-                                           r["crop"])
-                        rec.update({"version": VERSION, "page": r["page"],
-                                    "scale": r["scale"],
-                                    "mpp": metres_per_point(r["scale"]),
-                                    "offset": list(off),
-                                    "axes": [list(a) for a in axes]})
-                        g.ext = {KEY: rec}
-                    except Exception:                      # noqa: BLE001
-                        pass                 # the import works without it
-                    self._built[key] = g
+                    empty.append(r["page"])
+                    continue
+                # its style record (see _attach_styles) is added on OK
+                self._group_rows[id(g)] = (r, off, axes)
                 name = r["name"]
                 same = self._rows_of_page(r["pg"])
                 if name and len(same) > 1:
@@ -2347,6 +2759,41 @@ def _make_dialog_class():
                 groups.append(g)
                 self._layer_names.append(layer_name(path, r["page"], name))
             return groups, empty
+
+        def _group_for(self, r, opts, off, axes):
+            """The Group of row ``r`` at this place (IngeTrazo objects: main
+            thread) — kept from before, or built. None when the row has
+            nothing to import."""
+            key = (r["pg"], r["crop"], r["scale"], opts, off, axes)
+            g = self._built.get(key)
+            if g is None:
+                runs, _bb, arrays = self._runs(r, opts)
+                if not runs:
+                    return None
+                g = build_group(runs, metres_per_point(r["scale"]), "", off,
+                                axes, arrays)
+                # the sheet at its last two places, no more
+                same = [kk for kk in self._built if kk[:4] == key[:4]]
+                for kk in same[:-1]:
+                    del self._built[kk]
+                self._built[key] = g
+            return g
+
+        def _missing_groups(self, opts):
+            """``[(row, offset, axes)]`` of the ticked rows whose group at
+            its place is not built yet."""
+            rows = self._rows()
+            place = self._placements(rows, opts)
+            out = []
+            for k, r in enumerate(rows):
+                if not r["use"] or k not in place:
+                    continue
+                off, axes = place[k]
+                off = tuple(round(c, 6) for c in off)
+                if (r["pg"], r["crop"], r["scale"], opts, off, axes) \
+                        not in self._built:
+                    out.append((r, off, axes))
+            return out
 
         def _level_list(self):
             """[(name, z)] for the Levels panel: the storeys on the sheets,
@@ -2383,9 +2830,8 @@ def _make_dialog_class():
                 if not groups:
                     raise ValueError("Nothing to import on the ticked pages "
                                      "with these options.")
-                extra = []
-                if self.p.get("to_layers", True):
-                    extra += layer_commands(groups, self._layer_names)
+                names = self._layer_names if self.p.get("to_layers", True)                     else [None] * len(groups)
+                extra = layer_commands(groups, names)
                 cmd = insert_groups(self.viewport, groups, select,
                                     extra + self._levels_commands())
             finally:
@@ -2401,7 +2847,7 @@ def _make_dialog_class():
         def _filter_totals(self):
             """Sum of what the filters and the clean up did on the ticked
             rows (from the run cache)."""
-            stats = self.__dict__.get("_run_stats", {})
+            stats = self._run_stats
             opts = content_opts(self.p)
             tot = {}
             for r in self._rows():
@@ -2452,27 +2898,27 @@ def _make_dialog_class():
                 QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
 
         def _refresh_preview(self):
+            if self._accepting:            # OK waits for its own job
+                return
             if self._computing:            # a change during a build: later
                 self._timer.start()
                 return
-            self._undo_preview()
             if not self.preview.isChecked() or not self._pages:
+                self._undo_preview()
                 return
             if not any(r["use"] for r in self._rows()):
+                self._undo_preview()
                 self._banner("paused", "⏸ <b>Preview paused</b> — no page "
                              "ticked. It comes back by itself.")
                 return
+            cmd = self._preview_cmd
+            if cmd is not None and getattr(cmd, "key", None) == \
+                    self._state_key():
+                return                     # it shows these settings already
+            # The runs are made in the background; the groups follow when
+            # they are ready (_show_job) — the old preview stays till then.
             self._banner("busy", "⟳ Updating the preview…")
-            QApplication.processEvents(
-                QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
-            try:
-                self._preview_cmd = self._run(self._preview_progress, False)
-                self._banner("live", "● <b>LIVE PREVIEW</b> — "
-                             + self._result_text(self._preview_cmd.info)
-                             + " · changes apply instantly")
-            except Exception as exc:                       # noqa: BLE001
-                self._preview_cmd = None
-                self._banner("error", f"Preview failed: {exc}")
+            self._submit()
 
         def _preview_toggled(self, on):
             self._style_preview(on)
@@ -2512,14 +2958,46 @@ def _make_dialog_class():
                 self._error("Tick at least one page.")
                 return
             self._timer.stop()
-            self._read_ui()
-            rows = [r for r in self._rows() if r["use"]]
-            self.p["scale"] = rows[0]["scale"]
-            _save_params(self.p)
+            # What the import needs — runs and style records — is made in
+            # the background: wait for it, the window alive (a sheet still
+            # being read can change a name or scale meanwhile: then again).
+            self._accepting = True
+            try:
+                # names, scales and levels first (a second): they settle
+                # the rows the import is made for
+                if not self._wait(lambda: len(self._titles) == len(
+                        self._pages) or self._reader is None
+                        or not self._reader.is_alive(),
+                        "Reading the sheets…"):
+                    return
+                self._read_ui()
+                rows = [r for r in self._rows() if r["use"]]
+                if not rows:
+                    self._error("Tick at least one page.")
+                    return
+                self.p["scale"] = rows[0]["scale"]
+                _save_params(self.p)
+                while True:
+                    job = self._job
+                    if job is None or job.key != self._state_key() \
+                            or job.error is not None:
+                        job = self._submit(final=True)
+                    if not self._wait(lambda: job.styles_done
+                                      or job.error is not None
+                                      or job is not self._job,
+                                      "Preparing the import…"):
+                        return               # cancelled: back to the dialog
+                    if job.error is not None:
+                        self._error(f"Import failed:\n{job.error}")
+                        return
+                    if job.styles_done and job.key == self._state_key():
+                        break
+            finally:
+                self._accepting = False
             cmd = self._keep_preview()
             if cmd is None:
                 self._undo_preview()
-                prog = QProgressDialog("Reading pages…", None, 0,
+                prog = QProgressDialog("Building the sheets…", None, 0,
                                        len(rows), self)
                 prog.setWindowTitle(TITLE)
                 prog.setWindowModality(Qt.WindowModality.WindowModal)
@@ -2538,6 +3016,7 @@ def _make_dialog_class():
                     self._error(f"Import failed:\n{exc}")
                     return
                 prog.close()
+            self._attach_styles(cmd.groups)
             try:
                 info = cmd.info
                 self.viewport.flash_status(
@@ -2545,15 +3024,24 @@ def _make_dialog_class():
                     f"{info['edges']:,} edges (one undo step)", 6000)
             except Exception:                              # noqa: BLE001
                 pass
-            self._scan_id += 1                  # drop late worker answers
+            self._stop_threads()
             super().accept()
+
+        def _stop_threads(self):
+            """The background reading and build stop (late answers are
+            dropped)."""
+            self._closing = True
+            self._scan_id += 1
+            self._job_gen += 1
+            with self._cond:
+                self._cond.notify_all()
 
         def reject(self):
             if self._computing:
                 return
             self._timer.stop()
             self._undo_preview()
-            self._scan_id += 1
+            self._stop_threads()
             self._read_ui()
             _save_params(self.p)
             super().reject()
@@ -2564,7 +3052,7 @@ def _make_dialog_class():
                 return
             self._timer.stop()
             self._undo_preview()
-            self._scan_id += 1
+            self._stop_threads()
             super().closeEvent(ev)
 
     return PlanImportDialog
