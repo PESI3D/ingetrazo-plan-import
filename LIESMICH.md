@@ -5,7 +5,7 @@
 Importiert CAD-Pläne aus einem **Vektor-PDF** (Plot aus ArchiCAD, Revit, AutoCAD, Vectorworks …, kein Scan) als saubere Kanten im richtigen Maßstab — ein Blatt oder einen ganzen Plansatz. Grundrisse werden auf ihre Geschosshöhen gestapelt, Ansichten und Schnitte stehen hochkant drumherum, die Geschosse landen im Levels-Reiter und jedes Blatt auf einer eigenen Ebene.
 
 ## Installation
-`plan_import_tool_1.2.1.zip` aus dem [neuesten Release](../../releases/latest) laden und in den Plugin-Ordner entpacken (Extensions ▸ Open plugins folder; unter Windows `%APPDATA%\ingetrazo\plugins`). Der Ordner **`plan_import_tool`** muss dort als Unterordner liegen: `plugins\plan_import_tool\__init__.py`. IngeTrazo neu starten → **Extensions ▸ Plan Import…** oder die Werkzeugleiste **Plan Import**. Ab IngeTrazo 0.5.7 · getestet mit IngeTrazo 0.5.8.
+`plan_import_tool_1.3.zip` aus dem [neuesten Release](../../releases/latest) laden und in den Plugin-Ordner entpacken (Extensions ▸ Open plugins folder; unter Windows `%APPDATA%\ingetrazo\plugins`). Der Ordner **`plan_import_tool`** muss dort als Unterordner liegen: `plugins\plan_import_tool\__init__.py`. IngeTrazo neu starten → **Extensions ▸ Plan Import…** oder die Werkzeugleiste **Plan Import**. Ab IngeTrazo 0.5.7 · getestet mit IngeTrazo 0.6.0.
 
 ## Der Dialog
 Mit **Browse…** ein PDF wählen. Jede Seite bekommt eine Zeile; was sich vom Blatt lesen lässt, wird selbst ausgefüllt — **grün** = vom Blatt gelesen, **orange** = Vorschlag (bitte prüfen), **blau** = von dir gemessen/gesetzt. Eintippen löscht die Markierung.
@@ -37,7 +37,19 @@ Daneben das gewählte Blatt als Bild (Mausrad: Zoom · Ziehen: verschieben · Do
 - **Live Preview**: der Import erscheint im Modell und folgt jeder Änderung; **OK** übernimmt, **Cancel** nimmt zurück. Der ganze Import ist ein Undo-Schritt.
 - **Linienarten** (ab 1.2): jedes Blatt merkt sich, wie jede Linie gezeichnet war — Strichstärke, Farbe, Füllung (gepackt, ca. 100–300 kB je Grundriss). Das Plugin **Walls** wählt damit die Wände nach Linienart (z. B. die Wandfüllung) statt nach Geometrie.
 
+## Einheiten
+Der Dialog arbeitet in den **Einheiten des geöffneten Dokuments** — eingestellt in IngeTrazo unter **Fenster ▸ Einheiten…** (Strg+U) oder **Fenster ▸ Einstellungen… ▸ Einheiten**:
+- Längenfelder zeigen und lesen die Längeneinheit und -form des Dokuments: m, cm, mm, in, ft, Fuß-Zoll (`9'10"`) oder Fuß-Zoll mit Brüchen (`9'10 1/8"`).
+- Eingabe mit oder ohne Einheit: `25`, `2,5 cm`, `1'2"`, `3/4"`. Eine Zahl ohne Einheit gilt in der Dokumenteinheit (im Fuß-Zoll-Dokument: Zoll); ein Wert in einer anderen Einheit wird umgerechnet.
+- Winkel stehen in der Winkeleinheit des Dokuments (Grad, Radiant oder Gon), Flächen in seiner Flächeneinheit; Prozentfelder und Anzahlen haben keine Einheit. Das Dezimaltrennzeichen folgt dem Dokument — beim Tippen gehen `.` und `,`.
+- Ein Wechsel der Einheiten ändert nur Anzeige und Eingabe — das Modell bleibt exakt gleich. Nach dem Ändern den Dialog neu öffnen.
+- In IngeTrazo-Versionen vor 0.5.8 sind die Felder einfache Zahlen in Metern.
+- **Die Einheit des Plans ist die Arbeitseinheit.** Ein metrischer Plansatz (`1:100`, Höhen `+3,00`) wird in Metern gelesen, ein Zoll-Plansatz (`1/4" = 1'-0"`, Höhen `+10'-6"`) in Fuß und Zoll. **Levels on the plans in** bleibt auf *Automatic (from the plans)*; m, cm, mm, ft und in nur zum Umrechnen im Notfall.
+- Sind die Pläne in einem anderen System als das Dokument, stellt ein Häkchen daneben (vorgewählt) das Dokument beim Import auf die Einheit der Pläne um: ft-in bei Zoll-Plänen, Meter bei metrischen.
+- **Scale** ist der 1:N des Plans (`1/4" = 1'-0"` ist 1:48). Papiermaße und die Filter *Small parts below* / *Lines thinner than* bleiben in mm **auf dem Papier**.
+
 ## Änderungen
+- **1.3** — **viel schneller bei großen Plansätzen** (Beitrag von [@vincentlogarzo](https://github.com/vincentlogarzo), PR #1): Blätter werden 10× schneller gelesen, Close gaps sucht über einen Index, die Seitenansicht zeichnet Strichfolgen in einem Zug, Lesen und Clean-up laufen im Hintergrund — das Fenster bleibt bedienbar, Live Preview und Optionsänderungen frieren IngeTrazo nicht mehr ein. Das Importergebnis ist unverändert. **Dokumenteinheiten**: Geschosshöhe, Base, Ansichtsabstand, Höhen, *Close gaps* und *Measure scale* zeigen und lesen die Einheiten aus Einstellungen ▸ Einheiten (Papiermaße bleiben mm auf dem Papier); **Pläne in Fuß und Zoll**: Maßstäbe «1/4" = 1'-0"», «1" = 20'», Höhen «+10'-6"», «EL. 12'-0 1/2"» und englische Geschossnamen (First Floor, Level 2, Basement …) werden gelesen. Die Einheit des Plans ist die Arbeitseinheit: **Levels on the plans in** steht auf *Automatic (from the plans)* — Meter bei metrischen Plänen, Fuß und Zoll bei Zoll-Plänen; m, cm, mm, ft, in nur noch zum Umrechnen im Notfall. Sind die Pläne in einem anderen System als das Dokument, stellt ein Häkchen das Dokument beim Import darauf um (ft-in bei Zoll-Plänen, Meter bei metrischen). Getestet mit IngeTrazo 0.6.0.
 - **1.2.1** — der PDF-Leser füllt IngeTrazos Protokoll nicht mehr mit dem, was er in einem PDF selbst repariert («incorrect startxref pointer» …); getestet mit IngeTrazo 0.5.8.
 - **1.2** — **Linienarten**: jedes Blatt merkt sich, wie jede Linie gezeichnet war (Strichstärke, Farbe, Füllung) — für das Plugin [Walls](https://github.com/PESI3D/ingetrazo-walls).
 - **1.1** — Filter (Kleinteile, dünne Linien, Schraffuren, Farben), Aufräumen (Doppelte und Überlappungen, Lücken schließen), eigene Werkzeugleiste, Ergebniszeile.
